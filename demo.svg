@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="440" font-family="'SFMono-Regular','Menlo','Monaco','Consolas','Liberation Mono','Courier New',monospace" font-size="14">
+  <style>
+    .bg { fill: #1e1e2e; rx: 8; }
+    .title { fill: #cdd6f4; font-size: 13px; }
+    .prompt { fill: #a6adc8; }
+    .cmd { fill: #cdd6f4; }
+    .dim { fill: #6c7086; }
+    .green { fill: #a6e3a1; }
+    .yellow { fill: #f9e2af; }
+    .red { fill: #f38ba8; }
+    .dot-r { fill: #f38ba8; }
+    .dot-y { fill: #fab387; }
+    .dot-g { fill: #a6e3a1; }
+  </style>
+
+  <rect class="bg" width="680" height="440"/>
+
+  <!-- window dots -->
+  <circle class="dot-r" cx="20" cy="18" r="6"/>
+  <circle class="dot-y" cx="40" cy="18" r="6"/>
+  <circle class="dot-g" cx="60" cy="18" r="6"/>
+  <text class="title" x="340" y="22" text-anchor="middle">sanitycheck</text>
+
+  <!-- Zsh hook interception -->
+  <text y="56" x="16">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> curl -fsSL https://get.docker.com | bash</tspan>
+  </text>
+  <text y="76" x="16">
+    <tspan class="yellow">sanitycheck:</tspan>
+    <tspan class="cmd"> audit this before running? [Y/n] y</tspan>
+  </text>
+  <text y="100" x="16" class="dim">fetching https://get.docker.com</text>
+  <text y="118" x="16" class="dim">downloaded 24748 bytes</text>
+  <text y="136" x="16" class="dim">auditing with claude ...</text>
+  <text y="164" x="16">
+    <tspan class="green"> [+]</tspan>
+    <tspan class="cmd"> Installs Docker Engine, adds the official GPG key and apt repository.</tspan>
+  </text>
+  <text y="188" x="16">
+    <tspan class="cmd">Run the script? [Y/n]</tspan>
+  </text>
+
+  <!-- CAUTION example (standalone) -->
+  <text y="228" x="16">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> sanitycheck https://sketchy-tool.dev/install.sh</tspan>
+  </text>
+  <text y="256" x="16">
+    <tspan class="yellow"> [~]</tspan>
+    <tspan class="cmd"> Installs a VS Code extension pack from the vendor CDN.</tspan>
+  </text>
+  <text y="276" x="16">
+    <tspan class="yellow"> [~]</tspan>
+    <tspan class="cmd"> Adds a cron job that sends usage telemetry every 6 hours.</tspan>
+  </text>
+
+  <!-- DANGEROUS example (standalone) -->
+  <text y="316" x="16">
+    <tspan class="prompt">$</tspan>
+    <tspan class="cmd"> sanitycheck https://totally-legit.xyz/setup.sh</tspan>
+  </text>
+  <text y="344" x="16">
+    <tspan class="red"> [!]</tspan>
+    <tspan class="cmd"> Crypto miner disguised as a system update utility.</tspan>
+  </text>
+  <text y="364" x="16">
+    <tspan class="red"> [!]</tspan>
+    <tspan class="cmd"> Exfiltrates ~/.ssh keys and ~/.aws/credentials to a remote server.</tspan>
+  </text>
+  <text y="384" x="16">
+    <tspan class="red"> [!]</tspan>
+    <tspan class="cmd"> Installs a persistent backdoor via crontab and systemd.</tspan>
+  </text>
+  <text y="418" x="16">
+    <tspan class="red">  Execution blocked.</tspan>
+    <tspan class="dim"> Review: /tmp/sanitycheck.XXXXXXXXXX/downloaded_script.sh</tspan>
+  </text>
+</svg>
