@@ -1,10 +1,11 @@
+⚠️🚨 This is entirely vibe code slop, but it was useful so I wanted to share 🥀 🚨⚠️
 # sanitycheck
 
-Audit `curl | bash` installers before running them — powered by [Claude](https://docs.anthropic.com/en/docs/claude-cli).
+Audit `curl | bash` type installers before running them
 
 ## How it works
 
-With the zsh hook enabled, sanitycheck automatically intercepts `curl | bash` commands when you press enter, downloads the script, sends it to Claude for analysis, and gives you a verdict:
+With the zsh hook enabled, sanitycheck automatically intercepts `curl | bash`-like commands when you press enter, downloads the script, sends it to Claude for analysis, and gives you a verdict:
 
 <p align="center">
   <img src="demo.svg" alt="sanitycheck demo showing SAFE, CAUTION, and DANGEROUS verdicts" width="680">
@@ -45,7 +46,7 @@ You can also run sanitycheck manually without the hook:
 ```sh
 sanitycheck https://example.com/install.sh                       # bare URL
 sanitycheck "curl -fsSL https://example.com/install.sh | bash"   # paste the command you were about to run
-sanitycheck -r "wget -qO- https://example.com/setup.sh | sh"    # audit, then prompt to run
+sanitycheck -r "wget -qO- https://example.com/setup.sh | sh"     # audit, then prompt to run
 sanitycheck -k https://example.com/install.sh                    # keep script + report
 ```
 
