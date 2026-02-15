@@ -11,7 +11,7 @@ With the zsh hook enabled, sanitycheck automatically intercepts `curl | bash`-li
   <img src="demo.svg" alt="sanitycheck demo showing SAFE, CAUTION, and DANGEROUS verdicts" width="680">
 </p>
 
-The hook catches all common patterns:
+The hook catches common patterns like:
 
 - `curl ... | bash`, `curl ... | sh`, `curl ... | sudo bash`
 - `wget ... | bash`, `wget ... | sh`, `wget ... | sudo sh`
