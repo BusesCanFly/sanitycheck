@@ -38,10 +38,20 @@ Usage:
   ${PROG} "wget -qO- https://example.com/install.sh | sh"
 
 Flags:
-  -r, --run         Prompt to run the script after audit (off by default)
-  -k, --keep        Keep downloaded script and full report after exit
-  -o, --output DIR  Save files to DIR instead of a tmpdir
-  -h, --help        Show this help
+  -r, --run           Prompt to run the script after audit (off by default)
+  -k, --keep          Keep downloaded script and full report after exit
+  -o, --output DIR    Save files to DIR instead of a tmpdir
+  -p, --provider P    LLM provider: auto, ollama, claude-api, openai, claude-cli
+  -m, --model NAME    Model name (default depends on provider)
+  -h, --help          Show this help
+
+Environment variables:
+  SANITYCHECK_PROVIDER   LLM provider (default: auto)
+  SANITYCHECK_MODEL      Model override
+  OLLAMA_HOST            Ollama server URL (default: http://localhost:11434)
+  ANTHROPIC_API_KEY      API key for claude-api provider
+  OPENAI_API_KEY         API key for openai provider
+  OPENAI_BASE_URL        Base URL for openai provider (default: https://api.openai.com/v1)
 EOF
   exit 0
 }
@@ -55,6 +65,95 @@ trap cleanup EXIT
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# ---------------------------------------------------------------------------
+# LLM provider
+# ---------------------------------------------------------------------------
+
+SANITYCHECK_PROVIDER="${SANITYCHECK_PROVIDER:-auto}"
+SANITYCHECK_MODEL="${SANITYCHECK_MODEL:-}"
+
+json_escape() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))"
+  elif command -v jq >/dev/null 2>&1; then
+    jq -Rs .
+  else
+    die "python3 or jq is required for API providers"
+  fi
+}
+
+provider_ollama() {
+  local host="${OLLAMA_HOST:-http://localhost:11434}"
+  local model="${SANITYCHECK_MODEL:-llama3.1}"
+  local escaped
+  escaped=$(printf '%s' "$1" | json_escape)
+  local resp
+  resp=$(curl -sS --fail "$host/api/generate" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$model\",\"prompt\":$escaped,\"stream\":false}") \
+    || return 1
+  printf '%s' "$resp" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['response'])" 2>/dev/null \
+    || printf '%s' "$resp" | jq -r '.response' 2>/dev/null \
+    || return 1
+}
+
+provider_claude_api() {
+  local model="${SANITYCHECK_MODEL:-claude-sonnet-4-5-20250929}"
+  local escaped
+  escaped=$(printf '%s' "$1" | json_escape)
+  local resp
+  resp=$(curl -sS --fail "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "{\"model\":\"$model\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":$escaped}]}") \
+    || return 1
+  printf '%s' "$resp" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d['content'][0]['text'])" 2>/dev/null \
+    || printf '%s' "$resp" | jq -r '.content[0].text' 2>/dev/null \
+    || return 1
+}
+
+provider_openai() {
+  local base="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+  local model="${SANITYCHECK_MODEL:-gpt-4o}"
+  local escaped
+  escaped=$(printf '%s' "$1" | json_escape)
+  local resp
+  resp=$(curl -sS --fail "$base/chat/completions" \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":$escaped}]}") \
+    || return 1
+  printf '%s' "$resp" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d['choices'][0]['message']['content'])" 2>/dev/null \
+    || printf '%s' "$resp" | jq -r '.choices[0].message.content' 2>/dev/null \
+    || return 1
+}
+
+provider_claude_cli() {
+  claude -p "$1" 2>/dev/null
+}
+
+detect_provider() {
+  if command -v ollama >/dev/null 2>&1; then echo "ollama"
+  elif command -v claude >/dev/null 2>&1; then echo "claude-cli"
+  elif [[ -n "${OPENAI_API_KEY:-}" ]]; then echo "openai"
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then echo "claude-api"
+  else
+    die "no LLM provider found — install ollama or the claude CLI, or set OPENAI_API_KEY / ANTHROPIC_API_KEY"
+  fi
+}
+
+run_audit() {
+  local prompt="$1"
+  case "$SANITYCHECK_PROVIDER" in
+    ollama)     provider_ollama "$prompt" ;;
+    claude-api) provider_claude_api "$prompt" ;;
+    openai)     provider_openai "$prompt" ;;
+    claude-cli) provider_claude_cli "$prompt" ;;
+    *)          die "unknown provider: $SANITYCHECK_PROVIDER" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -93,6 +192,8 @@ while [[ $# -gt 0 ]]; do
     -r|--run)     RUN_AFTER=1; shift ;;
     -k|--keep)    KEEP=1; shift ;;
     -o|--output)  OUT_DIR="$2"; shift 2 ;;
+    -p|--provider) SANITYCHECK_PROVIDER="$2"; shift 2 ;;
+    -m|--model)    SANITYCHECK_MODEL="$2"; shift 2 ;;
     --)           shift; SCRIPT_ARGS=("$@"); break ;;
     -*)           die "unknown flag: $1 (see --help)" ;;
     *)
@@ -116,7 +217,18 @@ URL=$(extract_url "$INPUT") || die "could not find a URL in: $INPUT"
 # ---------------------------------------------------------------------------
 
 require_cmd curl
-require_cmd claude
+
+if [[ "$SANITYCHECK_PROVIDER" == "auto" ]]; then
+  SANITYCHECK_PROVIDER=$(detect_provider)
+fi
+
+case "$SANITYCHECK_PROVIDER" in
+  ollama)     require_cmd ollama ;;
+  claude-api) [[ -n "${ANTHROPIC_API_KEY:-}" ]] || die "ANTHROPIC_API_KEY required for claude-api" ;;
+  openai)     [[ -n "${OPENAI_API_KEY:-}" ]] || die "OPENAI_API_KEY required for openai" ;;
+  claude-cli) require_cmd claude ;;
+  *)          die "unknown provider: $SANITYCHECK_PROVIDER" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Download
@@ -147,7 +259,7 @@ if (( file_size == 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# Claude Code audit
+# LLM audit
 # ---------------------------------------------------------------------------
 
 AUDIT_PROMPT='You are a security auditor. A user is about to run the following
@@ -187,14 +299,16 @@ Only warn about things that are UNEXPECTED for a legitimate installer:
 
 Respond with raw JSON only.'
 
-info "auditing with claude …"
+info "auditing with ${SANITYCHECK_PROVIDER} …"
 
-RAW_RESPONSE=$(claude -p "$AUDIT_PROMPT
+FULL_PROMPT="$AUDIT_PROMPT
 
 --- BEGIN SCRIPT ---
 $(cat "$SCRIPT_FILE")
---- END SCRIPT ---" 2>/dev/null) \
-  || die "claude analysis failed"
+--- END SCRIPT ---"
+
+RAW_RESPONSE=$(run_audit "$FULL_PROMPT") \
+  || die "${SANITYCHECK_PROVIDER} analysis failed"
 
 # Save full report
 printf '%s\n' "$RAW_RESPONSE" > "$REPORT_FILE"

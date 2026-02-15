@@ -34,6 +34,9 @@ eval "$(sed -n '/^extract_url()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
 # parse_json
 eval "$(sed -n '/^parse_json()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
 
+# json_escape
+eval "$(sed -n '/^json_escape()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
+
 # ---------------------------------------------------------------------------
 printf 'extract_url\n'
 # ---------------------------------------------------------------------------
@@ -101,6 +104,47 @@ assert_eq "invalid JSON returns PARSE_ERROR" "PARSE_ERROR" "$(echo "$PARSED" | h
 
 PARSED=$(printf '{"summary":"no verdict field"}' | parse_json)
 assert_eq "missing verdict returns UNKNOWN" "UNKNOWN" "$(echo "$PARSED" | head -1)"
+
+# ---------------------------------------------------------------------------
+printf '\njson_escape\n'
+# ---------------------------------------------------------------------------
+
+assert_eq "simple string" \
+  '"hello world"' \
+  "$(printf 'hello world' | json_escape)"
+
+assert_eq "quotes escaped" \
+  '"say \"hi\""' \
+  "$(printf 'say "hi"' | json_escape)"
+
+assert_eq "newlines escaped" \
+  '"line1\nline2"' \
+  "$(printf 'line1\nline2' | json_escape)"
+
+assert_eq "backslash escaped" \
+  '"back\\slash"' \
+  "$(printf 'back\\slash' | json_escape)"
+
+# ---------------------------------------------------------------------------
+printf '\nprovider flags\n'
+# ---------------------------------------------------------------------------
+
+HELP_OUT=$(bash "$SCRIPT_DIR/sanitycheck.sh" --help 2>&1)
+if [[ "$HELP_OUT" == *"--provider"* ]]; then
+  pass "--provider in help"
+else
+  fail "--provider not in help output"
+fi
+if [[ "$HELP_OUT" == *"--model"* ]]; then
+  pass "--model in help"
+else
+  fail "--model not in help output"
+fi
+if [[ "$HELP_OUT" == *"SANITYCHECK_PROVIDER"* ]]; then
+  pass "SANITYCHECK_PROVIDER in help"
+else
+  fail "SANITYCHECK_PROVIDER not in help output"
+fi
 
 # ---------------------------------------------------------------------------
 printf '\nCLI flags\n'

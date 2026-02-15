@@ -5,7 +5,7 @@ Audit `curl | bash` type installers before running them
 
 ## How it works
 
-With the zsh hook enabled, sanitycheck automatically intercepts `curl | bash`-like commands when you press enter, downloads the script, sends it to Claude for analysis, and gives you a verdict:
+With the zsh hook enabled, sanitycheck automatically intercepts `curl | bash`-like commands when you press enter, downloads the script, sends it to an LLM for analysis, and gives you a verdict:
 
 <p align="center">
   <img src="demo.svg" alt="sanitycheck demo showing SAFE, CAUTION, and DANGEROUS verdicts" width="680">
@@ -37,7 +37,7 @@ cd sanitycheck
 
 The installer will offer to add the zsh hook and PATH entry to your `.zshrc` automatically.
 
-Requires: `bash`, `curl`, and the [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli).
+Requires: `bash`, `curl`, and an LLM provider (see below).
 
 ## Direct usage
 
@@ -55,7 +55,29 @@ sanitycheck -k https://example.com/install.sh                    # keep script +
 | `-r, --run` | Prompt to run the script after audit |
 | `-k, --keep` | Keep downloaded script and report |
 | `-o, --output DIR` | Save files to DIR instead of a tmpdir |
+| `-p, --provider P` | LLM provider (`auto`, `ollama`, `claude-api`, `openai`, `claude-cli`) |
+| `-m, --model NAME` | Model name (default depends on provider) |
 | `-h, --help` | Show help |
+
+## LLM providers
+
+sanitycheck auto-detects the first available provider in this order:
+
+| Provider | Needs | Default model |
+|----------|-------|---------------|
+| `ollama` | [Ollama](https://ollama.com) installed | `llama3.1` |
+| `claude-cli` | [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) | *(CLI default)* |
+| `openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| `claude-api` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5-20250929` |
+
+Override with `--provider` / `--model` flags or env vars:
+
+```sh
+export SANITYCHECK_PROVIDER=ollama
+export SANITYCHECK_MODEL=llama3.1
+```
+
+The `openai` provider also supports `OPENAI_BASE_URL` for any OpenAI-compatible API (LM Studio, vLLM, etc.).
 
 ## Uninstall
 

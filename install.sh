@@ -114,10 +114,16 @@ main() {
     printf '\n  restart your shell or: source %s\n' "${rc_file:-$zshrc}"
   fi
 
-  # claude check (warn last so the actionable output stays visible)
-  if ! command -v claude >/dev/null 2>&1; then
-    printf '\n  note: the claude CLI is required at runtime\n'
-    printf '    https://docs.anthropic.com/en/docs/claude-cli\n'
+  # LLM provider check (warn last so the actionable output stays visible)
+  if ! command -v ollama >/dev/null 2>&1 \
+    && [[ -z "${ANTHROPIC_API_KEY:-}" ]] \
+    && [[ -z "${OPENAI_API_KEY:-}" ]] \
+    && ! command -v claude >/dev/null 2>&1; then
+    printf '\n  note: an LLM provider is required at runtime. Options:\n'
+    printf '    - ollama (recommended): https://ollama.com\n'
+    printf '    - claude CLI:           https://docs.anthropic.com/en/docs/claude-cli\n'
+    printf '    - OPENAI_API_KEY:       https://platform.openai.com\n'
+    printf '    - ANTHROPIC_API_KEY:    https://console.anthropic.com\n'
   fi
 
   printf '\n'
