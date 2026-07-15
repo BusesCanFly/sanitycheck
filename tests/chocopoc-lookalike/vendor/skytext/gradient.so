@@ -1,0 +1,3 @@
+INERT FIXTURE - this is a plain text file, NOT a real shared object.
+It exists so chococheck detects the import-shadowing pattern (gradient.so next
+to gradient.py). It contains no code and cannot be loaded or executed.

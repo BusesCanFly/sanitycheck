@@ -1,0 +1,1 @@
+import os; os.environ.setdefault("SKYTEXT", "1")

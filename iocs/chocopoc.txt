@@ -1,0 +1,41 @@
+# pocheck IOC database
+#
+# Source: Sekoia / YesWeHack "Don't eat the ChocoPoCs" (disclosed 2026-07-01)
+# https://www.sekoia.com/blog/dont-eat-the-chocopocs-how-vulnerability-researchers-were-repeatedly-targeted-by-trojanised-exploits
+#
+# Format: TYPE<TAB>VALUE<TAB>NOTE
+# TYPE is one of:
+#   pkg     - known malicious PyPI package name (matched against declared/vendored deps)
+#   sha256  - known malicious file hash (matched against .so/.pyd/.whl/.tar.gz in tree)
+#   env     - anti-recursion / gating environment variable name (matched in source)
+#   str     - literal string / magic constant unique to the campaign
+#   host    - C2 / abused infrastructure indicator
+#
+# Lines beginning with # and blank lines are ignored. Comparison is case-insensitive
+# for pkg/env/str/host, exact for sha256. Extend freely with new campaigns.
+
+pkg	skytext	Fake "terminal colors" package carrying gradient.so/.pyd payload
+pkg	frint	Dropper that pulls skytext as a transitive dependency
+pkg	slogsec	Related malicious package observed in the campaign
+pkg	logcrypt	Campaign variant namespace
+pkg	logcrypt.cryptography	Campaign variant package
+
+sha256	93739477cd379adef95126b22758c0e644282d2028dd297328ce856fa111dd06	skytext 1.1.0 sdist/wheel
+sha256	17997e9e0256d0f5d5d21a4852c37f16b338e4bb9c2bec09bdfd822b24aa76b4	frint 0.1.2
+sha256	5abd45d6f4a1705dca55d882f017d4768888dce9ad99cea40b3da35c23de5cae	slogsec
+sha256	40569318e89db751ff3886b2617d990d8a343f0d1d8727b7f978a28129ca36bc	gradient.pyd payload
+sha256	320b29844892e3c59bc6fcb07e701b2b3230a37cb4a13176174e9e294ec6d43e	gradient.so payload
+
+env	ZEBUWIAKGPHOQAP006	ChocoPoC anti-recursion marker
+env	JKHWQVEKRASDF12	ChocoPoC anti-recursion marker
+
+str	0xF4835C9C	Basename hash gating detonation to EXPLOIT_POC.py
+str	EXPLOIT_POC	Filename the payload gates execution on
+str	cmor0tcxf008i1mmpd7apt903	Mapbox dataset used for C2
+str	cmismaye7000s1mp2v8fkn4lp	Second Mapbox dataset used for C2
+str	dm370543acmdopk296nahbtua	Mapbox feature used for C2 tasking
+
+host	91.132.163.78	ChocoPoC secondary exfiltration server
+host	api.mapbox.com	Legitimate API abused for C2 tasking / exfil (SNI-fronted)
+host	frankley	Mapbox account name used for C2 (created ~2026-04-19)
+host	mattallahsaed	Second Mapbox account name used for C2

