@@ -4,7 +4,33 @@
 
 ## sanitycheck
 
-Audit untrusted code before you run it. sanitycheck scans `curl | bash` installers, cloned PoC repos and their dependencies, and single scripts for supply-chain trojans and general malware, then gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. It never runs the code it checks.
+Audit untrusted code before you run it. sanitycheck scans `curl | bash` style installers, cloned PoC repos and their dependencies, pip/npm/etc installs, and single scripts for supply-chain trojans and general malware. Then, it gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. It never runs the code it checks.
+
+The goal is to check for the basics without any need for extra/concious user action. If no warnings are raised, execution follows as normal.
+
+<p align="center">
+  <img src="demo.svg" alt="sanitycheck auditing a git clone, a pip install, a curl|bash installer, and direct usage — showing DANGEROUS, CAUTION, and SAFE verdicts" width="720">
+</p>
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BusesCanFly/sanitycheck/main/install.sh | bash
+```
+
+(lol)
+
+Or clone and run locally:
+
+```sh
+git clone https://github.com/BusesCanFly/sanitycheck.git
+cd sanitycheck
+./install.sh
+```
+
+The installer adds the shell hook and PATH entry to your `.zshrc` / `.bashrc`, and installs the deep-pass helper and IOC database.
+
+Requires `bash`, `grep`, `find`. `python3` and an LLM provider are optional.
 
 ## How it works
 
@@ -53,25 +79,6 @@ General malware (shell, PowerShell, JS, Ruby, Go, Rust, Makefiles, Dockerfiles):
 
 Findings are weighted and de-duplicated per file, so a lone `eval()` is `CAUTION`, not `DANGEROUS`.
 
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/BusesCanFly/sanitycheck/main/install.sh | bash
-```
-
-> lol
-
-Or clone and run locally:
-
-```sh
-git clone https://github.com/BusesCanFly/sanitycheck.git
-cd sanitycheck
-./install.sh
-```
-
-The installer adds the shell hook and PATH entry to your `.zshrc` / `.bashrc`, and installs the deep-pass helper and IOC database.
-
-Requires `bash`, `grep`, `find`. `python3` and an LLM provider are optional.
 
 ## Direct usage
 

@@ -1,79 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="680" height="440" font-family="'SFMono-Regular','Menlo','Monaco','Consolas','Liberation Mono','Courier New',monospace" font-size="14">
-  <style>
-    .bg { fill: #1e1e2e; rx: 8; }
-    .title { fill: #cdd6f4; font-size: 13px; }
-    .prompt { fill: #a6adc8; }
-    .cmd { fill: #cdd6f4; }
-    .dim { fill: #6c7086; }
-    .green { fill: #a6e3a1; }
-    .yellow { fill: #f9e2af; }
-    .red { fill: #f38ba8; }
-    .dot-r { fill: #f38ba8; }
-    .dot-y { fill: #fab387; }
-    .dot-g { fill: #a6e3a1; }
-  </style>
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="432" viewBox="0 0 720 432" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+  <rect width="720" height="432" rx="10" fill="#0d1117"/>
+  <circle cx="22" cy="22" r="6" fill="#ff5f56"/>
+  <circle cx="42" cy="22" r="6" fill="#ffbd2e"/>
+  <circle cx="62" cy="22" r="6" fill="#27c93f"/>
+  <text x="360" y="26" text-anchor="middle" font-size="12" fill="#6e7681">sanitycheck</text>
 
-  <rect class="bg" width="680" height="440"/>
+  <g>
+    <!-- git clone hook -> DANGEROUS (ChocoPoC) -->
+    <text x="18" y="60" xml:space="preserve"><tspan fill="#7ee787">$</tspan><tspan fill="#c9d1d9"> git clone https://github.com/redteam/CVE-2026-31337-poc.git</tspan></text>
+    <text x="18" y="80" xml:space="preserve"><tspan fill="#8b949e">sanitycheck: scanning freshly cloned 'CVE-2026-31337-poc'...</tspan></text>
+    <text x="18" y="100" xml:space="preserve"><tspan fill="#f85149">  [!]</tspan><tspan fill="#39c5cf"> import-shadow</tspan><tspan fill="#c9d1d9">   gradient.so shadows gradient.py on import</tspan></text>
+    <text x="18" y="120" xml:space="preserve"><tspan fill="#f85149">  [!]</tspan><tspan fill="#39c5cf"> ioc-pkg</tspan><tspan fill="#c9d1d9">         depends on known-malicious 'skytext'</tspan></text>
+    <text x="18" y="140" xml:space="preserve"><tspan fill="#f85149" font-weight="bold">  [!] VERDICT: DANGEROUS</tspan></text>
 
-  <!-- window dots -->
-  <circle class="dot-r" cx="20" cy="18" r="6"/>
-  <circle class="dot-y" cx="40" cy="18" r="6"/>
-  <circle class="dot-g" cx="60" cy="18" r="6"/>
-  <text class="title" x="340" y="22" text-anchor="middle">sanitycheck</text>
+    <!-- pip install hook -> CAUTION (typosquat), prompts -->
+    <text x="18" y="176" xml:space="preserve"><tspan fill="#7ee787">$</tspan><tspan fill="#c9d1d9"> pip install -r requirements.txt</tspan></text>
+    <text x="18" y="196" xml:space="preserve"><tspan fill="#8b949e">sanitycheck: scanning '.' before pip install...</tspan></text>
+    <text x="18" y="216" xml:space="preserve"><tspan fill="#d29922">  [~]</tspan><tspan fill="#39c5cf"> typosquat</tspan><tspan fill="#c9d1d9">       'reqests' is one edit from 'requests'</tspan></text>
+    <text x="18" y="236" xml:space="preserve"><tspan fill="#d29922" font-weight="bold">  [~] VERDICT: CAUTION</tspan><tspan fill="#8b949e">   install anyway? [y/N]</tspan></text>
 
-  <!-- Zsh hook interception -->
-  <text y="56" x="16">
-    <tspan class="prompt">$</tspan>
-    <tspan class="cmd"> curl -fsSL https://get.docker.com | bash</tspan>
-  </text>
-  <text y="76" x="16">
-    <tspan class="yellow">sanitycheck:</tspan>
-    <tspan class="cmd"> audit this before running? [Y/n] y</tspan>
-  </text>
-  <text y="100" x="16" class="dim">fetching https://get.docker.com</text>
-  <text y="118" x="16" class="dim">downloaded 24748 bytes</text>
-  <text y="136" x="16" class="dim">auditing with claude ...</text>
-  <text y="164" x="16">
-    <tspan class="green"> [+]</tspan>
-    <tspan class="cmd"> Installs Docker Engine, adds the official GPG key and apt repository.</tspan>
-  </text>
-  <text y="188" x="16">
-    <tspan class="cmd">Run the script? [Y/n]</tspan>
-  </text>
+    <!-- curl | bash -> DANGEROUS (staged second stage) -->
+    <text x="18" y="272" xml:space="preserve"><tspan fill="#7ee787">$</tspan><tspan fill="#c9d1d9"> curl -fsSL https://get.tool.dev/install.sh | bash</tspan></text>
+    <text x="18" y="292" xml:space="preserve"><tspan fill="#8b949e">sanitycheck: audit this before running? [Y/n]</tspan></text>
+    <text x="18" y="312" xml:space="preserve"><tspan fill="#f85149">  [!]</tspan><tspan fill="#39c5cf"> download-exec</tspan><tspan fill="#c9d1d9">   fetches + runs a staged second-stage script</tspan></text>
+    <text x="18" y="332" xml:space="preserve"><tspan fill="#f85149" font-weight="bold">  [!] VERDICT: DANGEROUS</tspan></text>
 
-  <!-- CAUTION example (standalone) -->
-  <text y="228" x="16">
-    <tspan class="prompt">$</tspan>
-    <tspan class="cmd"> sanitycheck https://sketchy-tool.dev/install.sh</tspan>
-  </text>
-  <text y="256" x="16">
-    <tspan class="yellow"> [~]</tspan>
-    <tspan class="cmd"> Installs a VS Code extension pack from the vendor CDN.</tspan>
-  </text>
-  <text y="276" x="16">
-    <tspan class="yellow"> [~]</tspan>
-    <tspan class="cmd"> Adds a cron job that sends usage telemetry every 6 hours.</tspan>
-  </text>
-
-  <!-- DANGEROUS example (standalone) -->
-  <text y="316" x="16">
-    <tspan class="prompt">$</tspan>
-    <tspan class="cmd"> sanitycheck https://totally-legit.xyz/setup.sh</tspan>
-  </text>
-  <text y="344" x="16">
-    <tspan class="red"> [!]</tspan>
-    <tspan class="cmd"> Crypto miner disguised as a system update utility.</tspan>
-  </text>
-  <text y="364" x="16">
-    <tspan class="red"> [!]</tspan>
-    <tspan class="cmd"> Exfiltrates ~/.ssh keys and ~/.aws/credentials to a remote server.</tspan>
-  </text>
-  <text y="384" x="16">
-    <tspan class="red"> [!]</tspan>
-    <tspan class="cmd"> Installs a persistent backdoor via crontab and systemd.</tspan>
-  </text>
-  <text y="418" x="16">
-    <tspan class="red">  Execution blocked.</tspan>
-    <tspan class="dim"> Review: /tmp/sanitycheck.XXXXXXXXXX/downloaded_script.sh</tspan>
-  </text>
+    <!-- direct usage -> SAFE -->
+    <text x="18" y="368" xml:space="preserve"><tspan fill="#7ee787">$</tspan><tspan fill="#c9d1d9"> sanitycheck ./exploit.py</tspan></text>
+    <text x="18" y="388" xml:space="preserve"><tspan fill="#3fb950" font-weight="bold">  [+] VERDICT: SAFE</tspan><tspan fill="#8b949e">   nothing suspicious found by static checks</tspan></text>
+  </g>
 </svg>
