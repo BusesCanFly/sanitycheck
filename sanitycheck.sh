@@ -42,7 +42,9 @@ PROVIDER="${SANITYCHECK_PROVIDER:-auto}"
 MODEL="${SANITYCHECK_MODEL:-}"
 EXTRA_IOCS=()
 TARGET=""
-MODE=""             # installer | repo | file  (auto-detected)
+MODE=""             # installer | repo | file | pkgcheck  (auto-detected)
+CHECK_PKG=0         # --check-pkg : vet package NAMES against IOCs (no dir scan)
+PKG_NAMES=()
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -58,6 +60,7 @@ fi
 HELPER="${SANITYCHECK_DEEP:-}"
 if [[ -z "$HELPER" ]]; then
   for c in "$_HERE/sanitycheck_deep.py" \
+           "$_HERE/../share/sanitycheck/sanitycheck_deep.py" \
            "$_HERE/../libexec/sanitycheck/sanitycheck_deep.py" \
            "${XDG_DATA_HOME:-$HOME/.local/share}/sanitycheck/sanitycheck_deep.py"; do
     [[ -f "$c" ]] && { HELPER="$c"; break; }
@@ -757,7 +760,33 @@ classify_input() {
 }
 
 WORK_DIR=""; ROOT=""; SCRIPT_FILE=""
-cleanup() { [[ "$KEEP" != "1" && -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR" || true; }
+# --- progress spinner (knight-rider) -----------------------------------------
+# Shown on stderr while the audit runs so a slow scan (e.g. network dependency
+# resolution) doesn't look like the terminal hung. Only on a TTY, not for --json.
+SPIN_PID=""
+start_spinner() {
+  [[ -t 2 && "$JSON" != "1" ]] || return 0
+  ( w=10; pos=0; dir=1        # subshell: no `local` (invalid outside a function)
+    while :; do
+      bar=""
+      for ((i=0; i<w; i++)); do [[ "$i" == "$pos" ]] && bar+="*" || bar+="."; done
+      printf '\r  %sauditing%s [%s]' "$C" "$Z" "$bar" >&2
+      (( pos+=dir )); (( pos<=0 )) && dir=1; (( pos>=w-1 )) && dir=-1
+      sleep 0.08
+    done ) &
+  SPIN_PID=$!
+}
+stop_spinner() {
+  [[ -n "$SPIN_PID" ]] || return 0
+  kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null || true
+  printf '\r\033[K' >&2
+  SPIN_PID=""
+}
+
+cleanup() {
+  stop_spinner
+  [[ "$KEEP" != "1" && -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR" || true
+}
 trap cleanup EXIT
 
 make_workdir() {
@@ -863,6 +892,26 @@ resolve_installer_stages() {
   fi
 }
 
+# Vet package NAMES (from `pip/npm install <name>`) against the known-malicious
+# IOC list. No directory is scanned - the package's own code isn't on disk yet -
+# so this is instant and cannot false-positive on your existing files. Catches
+# e.g. `pip install frint` / `npm install skytext`.
+audit_pkgcheck() {
+  load_iocs
+  local name norm k i
+  for name in "${PKG_NAMES[@]:-}"; do
+    [[ -z "$name" ]] && continue
+    norm="$(norm_pkg "$name")"
+    i=0
+    for k in "${IOC_PKG[@]:-}"; do
+      [[ -z "$k" ]] && { i=$((i+1)); continue; }
+      [[ "$norm" == "$(norm_pkg "$k")" ]] && add_finding CRIT ioc-pkg "$name" 0 \
+        "Installing known-malicious package '$name' - ${IOC_PKG_NOTE[$i]:-known IOC}"
+      i=$((i+1))
+    done
+  done
+}
+
 audit_installer() {
   acquire_installer "$TARGET"
   resolve_installer_stages   # pull staged payloads into the workdir first...
@@ -911,6 +960,7 @@ main() {
       --offline)    OFFLINE=1; shift ;;
       --no-llm)     NO_LLM=1; shift ;;
       --no-follow)  FOLLOW=0; shift ;;
+      --check-pkg)  CHECK_PKG=1; shift ;;
       --provider)   PROVIDER="${2:-}"; shift 2 ;;
       --model)      MODEL="${2:-}"; shift 2 ;;
       --ioc)        EXTRA_IOCS+=("${2:-}"); shift 2 ;;
@@ -924,17 +974,35 @@ main() {
       -h|--help)    usage ;;
       --)           shift; [[ -z "$TARGET" && $# -gt 0 ]] && TARGET="$1"; break ;;
       -*)           die "unknown option: $1 (see --help)" ;;
-      *)            [[ -z "$TARGET" ]] && TARGET="$1" || TARGET="$TARGET $1"; shift ;;
+      *)            if [[ "$CHECK_PKG" == "1" ]]; then PKG_NAMES+=("$1")
+                    elif [[ -z "$TARGET" ]]; then TARGET="$1"; else TARGET="$TARGET $1"; fi; shift ;;
     esac
   done
-  [[ -n "$TARGET" ]] || usage
   setup_colors
   have grep || die "grep required"
 
+  # --check-pkg: vet package names, then exit. Stays silent when clean so it can
+  # run on every `install <name>` from the hook without adding noise.
+  if [[ "$CHECK_PKG" == "1" ]]; then
+    MODE="pkgcheck"; TARGET="${PKG_NAMES[*]:-}"
+    audit_pkgcheck
+    VERDICT="$(static_verdict)"
+    if [[ "$VERDICT" != "SAFE" ]]; then
+      if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi
+    fi
+    case "$VERDICT" in
+      DANGEROUS) exit 1 ;;
+      CAUTION)   [[ "$STRICT" == "1" ]] && exit 1 || exit 0 ;;
+      *)         exit 0 ;;
+    esac
+  fi
+
+  [[ -n "$TARGET" ]] || usage
   MODE="$(classify_input "$TARGET")"
   [[ "$MODE" == "unknown" ]] && die "could not tell what '$TARGET' is (not a path, URL, or curl|bash command)"
   info "mode=$MODE"
 
+  start_spinner
   if [[ "$MODE" == "installer" ]]; then
     audit_installer
   else
@@ -944,6 +1012,7 @@ main() {
   VERDICT="$(static_verdict)"
   run_llm
   [[ -n "$LLM_VERDICT" ]] && VERDICT="$(more_severe "$VERDICT" "$LLM_VERDICT")"
+  stop_spinner   # keep the spinner up through the whole audit, until the verdict
 
   if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi
 

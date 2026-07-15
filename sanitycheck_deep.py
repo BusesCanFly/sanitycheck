@@ -445,13 +445,14 @@ def resolve(root: Path, malicious: dict[str, str]) -> None:
         visited.add(norm)
         nodes += 1
 
-        # match every node (top-level and transitive) against IOCs + typosquat
-        if strip_pkg(name) in malicious:
-            tag = "ioc-pkg" if depth == 0 else "transitive-ioc-pkg"
-            emit("CRIT", tag, "declared-dependencies", 0,
-                 f"{'Depends on' if depth==0 else 'Transitively pulls'} "
-                 f"known-malicious package '{name}' via {path} - "
-                 f"{malicious[norm] or 'IOC'}")
+        # match transitive nodes against IOCs + typosquat. Direct (declared)
+        # deps are already matched by the shell engine, so only report the
+        # transitive ones here to avoid a duplicate ioc-pkg finding.
+        sp = strip_pkg(name)
+        if sp in malicious and depth > 0:
+            emit("CRIT", "transitive-ioc-pkg", "declared-dependencies", 0,
+                 f"Transitively pulls known-malicious package '{name}' via "
+                 f"{path} - {malicious[sp] or 'IOC'}")
         pop = is_typosquat(norm)
         if pop and depth > 0:
             emit("HIGH", "transitive-typosquat", "declared-dependencies", 0,

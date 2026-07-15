@@ -74,25 +74,51 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
   local bin; bin="$(_sanitycheck_bin)"
   local cmd="$1" trig="$2" project="$3"; shift 3
   [[ "$SANITYCHECK_HOOK" == "1" && -n "$bin" ]] || { command "$cmd" "$@"; return $?; }
-  local sub="" a
-  for a in "$@"; do [[ "$a" == -* ]] || { sub="$a"; break; }; done   # first non-flag arg
-  local scan=0
-  printf '%s' "$sub" | grep -qE "^(${trig})$" && scan=1
-  [[ -z "$sub" && "$project" == 1 ]] && scan=1                        # bare `npm`/`yarn` installs cwd
-  [[ "$scan" == 1 ]] || { command "$cmd" "$@"; return $?; }
-  # target: the cwd project (for project installers) and/or an explicit local path
-  local target="" prev=""
-  [[ "$project" == 1 ]] && target="."
+  # walk the args once: the subcommand (first non-flag), an explicit local target
+  # (a path, `-r <reqfile>`, or `-e <path>`), and whether a *named* registry
+  # package was requested.
+  local sub="" target="" prev="" seen=0 a
+  local -a pkgs; pkgs=()
   for a in "$@"; do
-    case "$prev" in -r|--requirement) [[ -f "$a" ]] && target="$(dirname "$a")" ;; -e|--editable) [[ -e "$a" ]] && target="$a" ;; esac
-    case "$a" in .|./*|/*|../*) [[ -e "$a" ]] && target="$a" ;; esac
+    if [[ "$a" == -* ]]; then prev="$a"; continue; fi
+    case "$prev" in
+      -r|--requirement) [[ -f "$a" ]] && target="$(dirname "$a")"; prev="$a"; continue ;;
+      -e|--editable)    [[ -e "$a" ]] && target="$a"; prev="$a"; continue ;;
+    esac
+    if [[ "$seen" == 0 ]]; then
+      sub="$a"; seen=1
+    else
+      case "$a" in
+        .|./*|../*|/*) [[ -e "$a" ]] && target="$a" ;;   # a local path
+        *) pkgs+=("$a") ;;                                # a registry package name
+      esac
+    fi
     prev="$a"
   done
-  [[ -n "$target" && -e "$target" ]] || { command "$cmd" "$@"; return $?; }
-  local what="$cmd${sub:+ $sub}"
-  echo "sanitycheck: scanning '$target' before $what..." >&2
-  "$bin" $(_sc_fast) "$target"; local rc=$?      # install=deep unless SANITYCHECK_HOOK_FAST
-  if [[ $rc -eq 1 ]]; then                        # exit 1 == DANGEROUS
+
+  # trigger only on an install-like subcommand (or a bare project installer)
+  local trigger=0
+  printf '%s' "$sub" | grep -qE "^(${trig})$" && trigger=1
+  [[ -z "$sub" && "$project" == 1 ]] && trigger=1
+  [[ "$trigger" == 1 ]] || { command "$cmd" "$@"; return $?; }
+
+  # bare project install (no path, no named pkg) audits the cwd project
+  [[ -z "$target" && "$project" == 1 && ${#pkgs[@]} -eq 0 ]] && target="."
+
+  local rc=0 what="$cmd${sub:+ $sub}"
+  if [[ -n "$target" && -e "$target" ]]; then
+    # a local project/path -> full scan
+    echo "sanitycheck: scanning '$target' before $what..." >&2
+    "$bin" $(_sc_fast) "$target"; rc=$?          # deep unless SANITYCHECK_HOOK_FAST
+  elif [[ ${#pkgs[@]} -gt 0 ]]; then
+    # named registry package(s) -> vet the NAME(s) against known-malicious IOCs.
+    # Instant, offline, no cwd scan; stays silent unless a name is flagged.
+    "$bin" --check-pkg "${pkgs[@]}"; rc=$?
+  else
+    command "$cmd" "$@"; return $?
+  fi
+
+  if [[ $rc -eq 1 ]]; then                         # exit 1 == DANGEROUS
     if [[ "${SANITYCHECK_HOOK_STRICT:-0}" == "1" ]]; then
       echo "sanitycheck: DANGEROUS - $what aborted." >&2; return 1
     fi
