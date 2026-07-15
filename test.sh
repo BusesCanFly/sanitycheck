@@ -119,6 +119,17 @@ gout=$(env SANITYCHECK_BIN="$wrapd/sc" SANITYCHECK_HOOK=1 bash -c "source '$HERE
 [[ "$gout" == *"scanning freshly cloned"* && "$gout" == *DANGEROUS* ]] && pass "git clone scans the checkout" || fail "git clone wrapper"
 rm -rf "$htmp" "$fbin" "$wrapd" "$gsrc" "$gdstp"
 
+if command -v zsh >/dev/null 2>&1; then
+  echo "hook: curl|bash matcher (zsh POSIX-ERE)"
+  zmatch() { CMD="$1" zsh -c "source '$HERE/hooks/sanitycheck.zsh'; _sanitycheck_match \"\$CMD\""; }
+  zmatch 'curl -fsSL https://x.io/i.sh | bash' && pass "matches curl|bash" || fail "curl|bash not matched"
+  zmatch 'wget -qO- https://x.io/i.sh | sudo sh' && pass "matches wget|sudo sh" || fail "wget|sudo sh not matched"
+  zmatch 'bash <(curl -fsSL https://x.io/i.sh)' && pass "matches bash <(curl)" || fail "process-sub not matched"
+  zmatch 'curl -fsSL https://x.io/f.tgz -o f.tgz' && fail "false-matched a plain curl download" || pass "ignores plain curl download"
+else
+  echo "hook: (zsh unavailable — skipping curl|bash matcher test)"
+fi
+
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"
 scan caution-poc --strict; eq "exit (--strict)" "$EXIT" "1"

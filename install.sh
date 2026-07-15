@@ -31,7 +31,9 @@ main() {
   fi
   if [[ -z "$src_dir" ]]; then
     src_dir="$(mktemp -d "${TMPDIR:-/tmp}/sanitycheck-install.XXXXXX")"
-    trap 'rm -rf "$src_dir"' EXIT
+    # expand the path into the trap now: src_dir is local to main() and would be
+    # out of scope (unbound under `set -u`) by the time the EXIT trap runs.
+    trap "rm -rf '$src_dir'" EXIT
     printf 'downloading sanitycheck...\n'
     mkdir -p "$src_dir/hooks" "$src_dir/iocs"
     curl -fsSL -o "$src_dir/sanitycheck.sh"          "$REPO_URL/sanitycheck.sh"

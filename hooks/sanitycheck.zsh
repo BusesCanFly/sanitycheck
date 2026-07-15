@@ -34,11 +34,13 @@ _sc_fast() { [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && printf -- '--fast'; }
 # --- 1. curl|bash interception (zsh only; needs the zle line editor) ----------
 if [[ -n "${ZSH_VERSION:-}" ]]; then
   _sanitycheck_match() {
+    # NB: zsh's =~ uses POSIX ERE (no \s / \d), so use [[:space:]] classes -
+    # \s silently never matches here (notably on macOS).
     local cmd="$1"
-    [[ "$cmd" =~ "(curl|wget)\s.*\|\s*(sudo\s+)?(bash|sh)" ]] && return 0
-    [[ "$cmd" =~ "(bash|sh)\s+-c\s.*\\\$\(.*\s*(curl|wget)" ]] && return 0
-    [[ "$cmd" =~ "(bash|sh)\s+<\(.*\s*(curl|wget)" ]] && return 0
-    [[ "$cmd" =~ "(source|\.)\s+<\(.*\s*(curl|wget)" ]] && return 0
+    [[ "$cmd" =~ "(curl|wget)[[:space:]].*\|[[:space:]]*(sudo[[:space:]]+)?(bash|sh)" ]] && return 0
+    [[ "$cmd" =~ "(bash|sh)[[:space:]]+-c[[:space:]].*\\\$\(.*[[:space:]]*(curl|wget)" ]] && return 0
+    [[ "$cmd" =~ "(bash|sh)[[:space:]]+<\(.*[[:space:]]*(curl|wget)" ]] && return 0
+    [[ "$cmd" =~ "(source|\.)[[:space:]]+<\(.*[[:space:]]*(curl|wget)" ]] && return 0
     return 1
   }
   _sanitycheck_accept_line() {
@@ -59,25 +61,11 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   zle -N accept-line _sanitycheck_accept_line
 fi
 
-# --- 2. git clone wrapper: fast static scan of the fresh checkout ------------
-git() {
-  local bin; bin="$(_sanitycheck_bin)"
-  if [[ "$SANITYCHECK_HOOK" != "1" || -z "$bin" || "${1:-}" != "clone" ]]; then
-    command git "$@"; return $?
-  fi
-  command git "$@" || return $?
-  local args=("$@") dest="" a
-  for a in "${args[@]:1}"; do [[ "$a" == -* ]] || dest="$a"; done
-  if [[ "$dest" == *://* || "$dest" == *@*:* || "$dest" == *.git ]]; then
-    dest="$(basename "${dest%.git}")"
-  fi
-  [[ -d "$dest" ]] || return 0
-  echo "sanitycheck: scanning freshly cloned '$dest'..." >&2
-  "$bin" --fast "$dest" || true      # clone=fast: dependencies aren't pulled yet
-  return 0
-}
+# --- 2 & 3. command wrappers (git clone, and the dependency installers) ------
+# The wrapper functions shadow real command names, so they are defined together
+# at the bottom of this file with alias expansion disabled (see the note there).
 
-# --- 3. dependency-install wrappers: deep scan before deps are pulled --------
+# shared guard for every "install this project's dependencies" command:
 # One guard for every "install this project's dependencies" command. Registry
 # packages are fetched by the tool itself (their install scripts can't be seen
 # until download), so we vet the local project/target - its manifests (for the
@@ -114,6 +102,38 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
   fi
   command "$cmd" "$@"
 }
+# These wrappers shadow real command names. zsh expands aliases at parse time,
+# so a matching `alias pip=...` would break a bare `pip() { ... }` definition and
+# abort the hook while it is being sourced. Turn alias expansion off just while
+# we define them, then restore it. (Your aliases are untouched; note that a
+# command you have aliased still uses your alias, not this wrapper.)
+if [[ -n "${ZSH_VERSION:-}" ]] && [[ -o aliases ]]; then
+  _sc_realias=1; unsetopt aliases
+else
+  _sc_realias=0
+fi
+
+git() {
+  local bin; bin="$(_sanitycheck_bin)"
+  if [[ "$SANITYCHECK_HOOK" != "1" || -z "$bin" || "${1:-}" != "clone" ]]; then
+    command git "$@"; return $?
+  fi
+  command git "$@" || return $?
+  # destination = last non-flag arg after `clone` (or the repo's basename)
+  local dest="" a first=1
+  for a in "$@"; do
+    [[ "$first" == "1" ]] && { first=0; continue; }
+    [[ "$a" == -* ]] || dest="$a"
+  done
+  if [[ "$dest" == *://* || "$dest" == *@*:* || "$dest" == *.git ]]; then
+    dest="$(basename "${dest%.git}")"
+  fi
+  [[ -d "$dest" ]] || return 0
+  echo "sanitycheck: scanning freshly cloned '$dest'..." >&2
+  "$bin" --fast "$dest" || true      # clone=fast: dependencies aren't pulled yet
+  return 0
+}
+
 pip()    { _sc_install_guard pip    'install'          0 "$@"; }
 pip3()   { _sc_install_guard pip3   'install'          0 "$@"; }
 npm()    { _sc_install_guard npm    'install|i|ci|add' 1 "$@"; }
@@ -122,5 +142,8 @@ pnpm()   { _sc_install_guard pnpm   'install|i|add'    1 "$@"; }
 poetry() { _sc_install_guard poetry 'install|add|sync' 1 "$@"; }
 uv()     { _sc_install_guard uv     'sync|add|pip'     1 "$@"; }
 # add another manager in one line, e.g.:
-# bundle() { _sc_install_guard bundle 'install' 1 "$@"; }
+# bundle()   { _sc_install_guard bundle 'install' 1 "$@"; }
 # composer() { _sc_install_guard composer 'install|require|update' 1 "$@"; }
+
+[[ "${_sc_realias:-0}" == "1" ]] && setopt aliases
+unset _sc_realias

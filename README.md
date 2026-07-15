@@ -4,9 +4,9 @@
 
 ## sanitycheck
 
-Audit untrusted code before you run it. sanitycheck scans `curl | bash` style installers, cloned PoC repos and their dependencies, pip/npm/etc installs, and single scripts for supply-chain trojans and general malware. Then, it gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. It never runs the code it checks.
+Audit untrusted code before you run it. `sanitycheck` automatically scans `curl | bash` style installers, cloned PoC repos and their dependencies, pip/npm/etc installs, and single scripts as/before you run them. Then, it gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. (It never runs any code it checks)
 
-The goal is to check for the basics without any need for extra/concious user action. If no warnings are raised, execution follows as normal.
+The goal is to provide a semblance of security checking / "best practice" without requiring any extra concious action/effort. Shell hooks catch the commands, and if no warnings are raised, allow them to run as normal.
 
 <p align="center">
   <img src="demo.svg" alt="sanitycheck auditing a git clone, a pip install, a curl|bash installer, and direct usage — showing DANGEROUS, CAUTION, and SAFE verdicts" width="720">
