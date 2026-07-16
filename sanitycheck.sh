@@ -43,7 +43,8 @@ MODEL="${SANITYCHECK_MODEL:-}"
 EXTRA_IOCS=()
 TARGET=""
 MODE=""             # installer | repo | file | pkgcheck  (auto-detected)
-CHECK_PKG=0         # --check-pkg : vet package NAMES against IOCs (no dir scan)
+CHECK_PKG=0         # --check-pkg : vet named packages (name IOC + fetch/scan)
+ECOSYSTEM=""        # --ecosystem : pypi | npm  (registry to fetch --check-pkg from)
 PKG_NAMES=()
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,14 +131,27 @@ N_CRIT=0; N_HIGH=0; N_MED=0; N_LOW=0
 # In installer mode, patterns that are normal for legitimate installers are
 # demoted so the tool doesn't cry wolf. Unambiguous malware tags keep full
 # severity. (Effectiveness includes staying trusted enough to be read.)
-demote_for_installer() { # tag sev  ->  echoes possibly-lowered sev
+demote_for_mode() { # tag sev  ->  echoes a possibly-lowered severity
   local tag="$1" sev="$2"
-  [[ "$MODE" == "installer" ]] || { printf '%s' "$sev"; return; }
-  case "$tag" in
-    persistence|dep-links|net-exec|build-ext|shell-exec) printf 'LOW' ;;
-    download-exec) [[ "$sev" == "HIGH" ]] && printf 'MED' || printf '%s' "$sev" ;;
-    *) printf '%s' "$sev" ;;
-  esac
+  if [[ "$MODE" == "installer" ]]; then
+    # normal-for-installers patterns
+    case "$tag" in
+      persistence|dep-links|net-exec|build-ext|shell-exec) printf 'LOW'; return ;;
+      download-exec) [[ "$sev" == "HIGH" ]] && { printf 'MED'; return; } ;;
+    esac
+  elif [[ "$MODE" == "pkgcheck" ]]; then
+    # a published package legitimately ships compiled extensions, uses ctypes/
+    # cffi, calls exec for py2/3 compat, makes network calls, pickles, etc.
+    # Demote those dual-use signals; the unambiguous install-time-exec and
+    # malware signals (install-hook, *-decode-exec, reverse-shell, exfil,
+    # import-shadow, IOC hits, ...) keep full severity.
+    case "$tag" in
+      native-load|native-vendored|dyn-exec|shell-exec|net-exec|build-ext|\
+      pickle-exec|pickle-reduce|hex-blob|decode|blob|self-inspect|sandbox-check|\
+      anti-debug|timestomp|lib-inject|screencap|mapbox-c2) printf 'LOW'; return ;;
+    esac
+  fi
+  printf '%s' "$sev"
 }
 
 SEP=$'\x1f'
@@ -150,7 +164,7 @@ add_finding() { # sev tag file line msg
   local key="$2$SEP$3$SEP$5"
   case "$SEEN_KEYS" in *"$SEP$key$SEP"*) return 0 ;; esac
   SEEN_KEYS="$SEEN_KEYS$key$SEP"
-  local sev; sev="$(demote_for_installer "$2" "$1")"
+  local sev; sev="$(demote_for_mode "$2" "$1")"
   local tag="$2" file="$3" line="$4" msg="$5"
   F_SEV+=("$sev"); F_TAG+=("$tag"); F_FILE+=("$file"); F_LINE+=("$line"); F_MSG+=("$msg")
   case "$sev" in
@@ -172,6 +186,14 @@ ANY="*.py *.pyx *.sh *.bash *.rb *.pl *.php *.js *.ts *.go *.c *.ps1"
 # ANY plus build-system files that execute on build/install (gradle=Groovy,
 # build.rs=cargo, Rakefile/extconf.rb/Gemfile=ruby, build.sbt=scala).
 ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile"
+# skip vendored / VCS / build dirs in every tree walk: they aren't the code you
+# wrote (scanning them is slow and false-positive-prone). Matches the deep-pass.
+# NB: do NOT exclude "vendor" - vendored native extensions are exactly where
+# ChocoPoC hides.
+GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv
+  --exclude-dir=venv --exclude-dir=__pycache__ --exclude-dir=dist
+  --exclude-dir=build --exclude-dir=.tox --exclude-dir=.mypy_cache
+  --exclude-dir=.pytest_cache)
 
 load_rules() {
   # install-time code execution (pip/npm runs this; the #1 supply-chain vector)
@@ -315,7 +337,7 @@ run_content_rules() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
       add_finding "$sev" "$tag" "$file" "$line" "$msg"
-    done < <(grep -rInE "${inc[@]}" -- "$ere" "$ROOT" 2>/dev/null | head -n 40 || true)
+    done < <(grep -rInE "${GREP_EXCLUDES[@]}" "${inc[@]}" -- "$ere" "$ROOT" 2>/dev/null | head -n 40 || true)
   done
 }
 
@@ -433,10 +455,10 @@ sha256_file() {
 }
 
 IOC_PKG=(); IOC_SHA=(); IOC_ENV=(); IOC_STR=(); IOC_HOST=()
-IOC_PKG_NOTE=(); IOC_SHA_NOTE=()
+IOC_PKG_NOTE=(); IOC_SHA_NOTE=(); IOC_PKG_NORM=()
 load_iocs() {
   local files=("$IOC_DB" "${EXTRA_IOCS[@]}")
-  local f
+  local f k
   for f in "${files[@]}"; do
     [[ -n "$f" && -f "$f" ]] || continue
     while IFS=$'\t' read -r type value note; do
@@ -450,6 +472,9 @@ load_iocs() {
       esac
     done < "$f"
   done
+  # pre-normalize IOC package names once, so the match loops don't fork norm_pkg
+  # per (declared-dep x ioc) pair.
+  for k in "${IOC_PKG[@]:-}"; do IOC_PKG_NORM+=("$(norm_pkg "$k")"); done
 }
 
 # Normalize a package name for IOC matching: lowercase and drop all . _ -
@@ -462,9 +487,9 @@ detect_iocs() {
     [[ -z "$d" ]] && continue
     local dl; dl="$(norm_pkg "$d")"
     local i=0
-    for k in "${IOC_PKG[@]:-}"; do
+    for k in "${IOC_PKG_NORM[@]:-}"; do
       [[ -z "$k" ]] && { i=$((i+1)); continue; }
-      if [[ "$dl" == "$(norm_pkg "$k")" ]]; then
+      if [[ "$dl" == "$k" ]]; then
         add_finding CRIT ioc-pkg "declared-dependencies" 0 \
           "Depends on known-malicious package '$d' - ${IOC_PKG_NOTE[$i]:-ChocoPoC IOC}"
       fi
@@ -481,7 +506,7 @@ detect_iocs() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
       add_finding CRIT ioc-str "$file" "$line" "Contains ChocoPoC IOC string (env marker / magic constant / C2 host)"
-    done < <(grep -rInaE -- "$joined" "$ROOT" 2>/dev/null | head -n 20 || true)
+    done < <(grep -rInaE "${GREP_EXCLUDES[@]}" -- "$joined" "$ROOT" 2>/dev/null | head -n 20 || true)
   fi
   if [[ ${#IOC_SHA[@]} -gt 0 ]]; then
     local art
@@ -898,18 +923,49 @@ resolve_installer_stages() {
 # e.g. `pip install frint` / `npm install skytext`.
 audit_pkgcheck() {
   load_iocs
+  # 1. instant, offline name check against the known-malicious IOC list.
   local name norm k i
   for name in "${PKG_NAMES[@]:-}"; do
     [[ -z "$name" ]] && continue
     norm="$(norm_pkg "$name")"
     i=0
-    for k in "${IOC_PKG[@]:-}"; do
+    for k in "${IOC_PKG_NORM[@]:-}"; do
       [[ -z "$k" ]] && { i=$((i+1)); continue; }
-      [[ "$norm" == "$(norm_pkg "$k")" ]] && add_finding CRIT ioc-pkg "$name" 0 \
+      [[ "$norm" == "$k" ]] && add_finding CRIT ioc-pkg "$name" 0 \
         "Installing known-malicious package '$name' - ${IOC_PKG_NOTE[$i]:-known IOC}"
       i=$((i+1))
     done
   done
+
+  # 2. content inspection: download each package's artifact from the registry
+  # and scan the REAL code (never executed - just untar/unzip). Online + a
+  # known ecosystem only; --fast/--offline stay at the name check above.
+  [[ "$FAST" != "1" && "$OFFLINE" != "1" && -n "$ECOSYSTEM" ]] || return 0
+  have python3 || return 0
+  [[ -n "$HELPER" && -f "$HELPER" ]] || return 0
+  ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sanitycheck-pkg.XXXXXX")"
+  WORK_DIR="$ROOT"
+  local sev tag file line msg f
+  # fetch+extract (helper reports missing / too-large packages as findings)
+  while IFS=$'\t' read -r sev tag file line msg; do
+    [[ -z "$sev" ]] && continue
+    add_finding "$sev" "$tag" "$file" "${line:-0}" "$msg"
+  done < <(python3 "$HELPER" --fetch "$ECOSYSTEM" --dest "$ROOT" "${PKG_NAMES[@]}" 2>/dev/null || true)
+  # scan the extracted contents with the full static engine (offline)
+  if find "$ROOT" -type f 2>/dev/null | head -1 | grep -q .; then
+    load_rules; collect_python_deps
+    run_content_rules
+    detect_native_shadowing
+    detect_pth_files
+    detect_npm_scripts
+    detect_autorun_files
+    detect_iocs
+    while IFS=$'\t' read -r sev tag file line msg; do
+      [[ -z "$sev" ]] && continue
+      f="$file"; [[ "$file" == "declared-dependencies" ]] || f="$ROOT/$file"
+      add_finding "$sev" "$tag" "$f" "${line:-0}" "$msg"
+    done < <(python3 "$HELPER" "$ROOT" 2>/dev/null || true)
+  fi
 }
 
 audit_installer() {
@@ -961,6 +1017,7 @@ main() {
       --no-llm)     NO_LLM=1; shift ;;
       --no-follow)  FOLLOW=0; shift ;;
       --check-pkg)  CHECK_PKG=1; shift ;;
+      --ecosystem)  ECOSYSTEM="${2:-}"; shift 2 ;;
       --provider)   PROVIDER="${2:-}"; shift 2 ;;
       --model)      MODEL="${2:-}"; shift 2 ;;
       --ioc)        EXTRA_IOCS+=("${2:-}"); shift 2 ;;
@@ -985,7 +1042,9 @@ main() {
   # run on every `install <name>` from the hook without adding noise.
   if [[ "$CHECK_PKG" == "1" ]]; then
     MODE="pkgcheck"; TARGET="${PKG_NAMES[*]:-}"
+    start_spinner
     audit_pkgcheck
+    stop_spinner
     VERDICT="$(static_verdict)"
     if [[ "$VERDICT" != "SAFE" ]]; then
       if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi

@@ -19,7 +19,7 @@ eval "$(sed -n '/^extract_url()/,/^}/p'         "$SC")"
 eval "$(sed -n '/^classify_input()/,/^}/p'      "$SC")"
 eval "$(sed -n '/^sev_rank()/,/^}/p'            "$SC")"
 eval "$(sed -n '/^more_severe()/,/^}/p'         "$SC")"
-eval "$(sed -n '/^demote_for_installer()/,/^}/p' "$SC")"
+eval "$(sed -n '/^demote_for_mode()/,/^}/p' "$SC")"
 eval "$(sed -n '/^parse_llm()/,/^}/p' "$SC")"
 
 echo "unit: parse_llm (LLM response parsing)"
@@ -53,13 +53,17 @@ echo "unit: more_severe"
 eq "DANGEROUS beats CAUTION" "$(more_severe CAUTION DANGEROUS)" "DANGEROUS"
 eq "CAUTION beats SAFE"      "$(more_severe SAFE CAUTION)" "CAUTION"
 
-echo "unit: demote_for_installer (anti-cry-wolf)"
+echo "unit: demote_for_mode (anti-cry-wolf)"
 MODE=installer
-eq "persistence demoted to LOW"   "$(demote_for_installer persistence MED)" "LOW"
-eq "download-exec HIGH -> MED"    "$(demote_for_installer download-exec HIGH)" "MED"
-eq "reverse-shell stays HIGH"     "$(demote_for_installer reverse-shell HIGH)" "HIGH"
+eq "persistence demoted to LOW"   "$(demote_for_mode persistence MED)" "LOW"
+eq "download-exec HIGH -> MED"    "$(demote_for_mode download-exec HIGH)" "MED"
+eq "reverse-shell stays HIGH"     "$(demote_for_mode reverse-shell HIGH)" "HIGH"
 MODE=repo
-eq "no demotion in repo mode"     "$(demote_for_installer persistence MED)" "MED"
+eq "no demotion in repo mode"     "$(demote_for_mode persistence MED)" "MED"
+MODE=pkgcheck
+eq "pkgcheck demotes native-vendored"  "$(demote_for_mode native-vendored HIGH)" "LOW"
+eq "pkgcheck keeps install-hook"       "$(demote_for_mode install-hook HIGH)" "HIGH"
+MODE=repo
 
 # --- integration: fixtures (offline, no LLM) ---------------------------------
 scan() { # dir [flags...]
@@ -129,6 +133,12 @@ if command -v zsh >/dev/null 2>&1; then
 else
   echo "hook: (zsh unavailable — skipping curl|bash matcher test)"
 fi
+
+echo "check-pkg: named-install name vetting (offline name match, no dir scan)"
+"$SC" --offline --check-pkg frint >/dev/null 2>&1; eq "known-malicious name -> exit 1" "$?" "1"
+"$SC" --offline --check-pkg lodash requests >/dev/null 2>&1; eq "clean names -> exit 0" "$?" "0"
+cpo="$("$SC" --offline --check-pkg lodash 2>&1)"; [[ -z "$cpo" ]] && pass "clean name is silent" || fail "clean name printed output"
+"$SC" --offline --check-pkg sky-text >/dev/null 2>&1; eq "separator variant (sky-text) -> exit 1" "$?" "1"
 
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"

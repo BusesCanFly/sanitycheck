@@ -111,9 +111,15 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
     echo "sanitycheck: scanning '$target' before $what..." >&2
     "$bin" $(_sc_fast) "$target"; rc=$?          # deep unless SANITYCHECK_HOOK_FAST
   elif [[ ${#pkgs[@]} -gt 0 ]]; then
-    # named registry package(s) -> vet the NAME(s) against known-malicious IOCs.
-    # Instant, offline, no cwd scan; stays silent unless a name is flagged.
-    "$bin" --check-pkg "${pkgs[@]}"; rc=$?
+    # named registry package(s) -> vet the NAME(s) against IOCs and, when online,
+    # download+scan the actual package contents (no cwd scan). Silent unless
+    # something is flagged.
+    local eco=""
+    case "$cmd" in pip|pip3|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; esac
+    local -a cka; cka=(--check-pkg)
+    [[ -n "$eco" ]] && cka+=(--ecosystem "$eco")
+    [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
+    "$bin" "${cka[@]}" "${pkgs[@]}"; rc=$?
   else
     command "$cmd" "$@"; return $?
   fi

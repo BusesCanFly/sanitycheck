@@ -43,6 +43,7 @@ import re
 import sys
 import time
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
@@ -482,15 +483,166 @@ def resolve(root: Path, malicious: dict[str, str]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Fetch a registry package's artifact and extract it (NO code execution - just
+# download + untar/unzip) so the caller can statically scan the real contents.
+# Everything is bounded and extraction is hardened against path traversal / zip
+# bombs, because these archives are untrusted.
+# --------------------------------------------------------------------------- #
+
+FETCH_MAX_PKGS = 6
+FETCH_ARTIFACT_MAX = 30 * 1024 * 1024      # per-artifact download cap
+EXTRACT_MAX_FILES = 4000
+EXTRACT_MAX_BYTES = 100 * 1024 * 1024
+
+
+def http_get_bytes(url: str, maxsize: int) -> bytes | None:
+    req = urllib.request.Request(url, headers={"User-Agent": "sanitycheck"})
+    try:
+        with urllib.request.urlopen(req, timeout=RESOLVE_TIMEOUT) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = resp.read(maxsize + 1)
+            return None if len(data) > maxsize else data
+    except Exception:
+        return None
+
+
+def npm_metadata(name: str) -> dict | None:
+    url = "https://registry.npmjs.org/" + urllib.parse.quote(name, safe="@")
+    req = urllib.request.Request(url, headers={"User-Agent": "sanitycheck"})
+    try:
+        with urllib.request.urlopen(req, timeout=RESOLVE_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        return {"__http__": e.code}
+    except Exception:
+        return None
+
+
+def _within(dest: str, member: str) -> bool:
+    if member.startswith("/") or member.startswith("\\"):
+        return False
+    if ".." in member.replace("\\", "/").split("/"):
+        return False
+    d = os.path.realpath(dest)
+    t = os.path.realpath(os.path.join(dest, member))
+    return t == d or t.startswith(d + os.sep)
+
+
+def _extract_tar(data: bytes, dest: str) -> None:
+    import io
+    import tarfile
+    files = total = 0
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        for m in tf.getmembers():
+            if files >= EXTRACT_MAX_FILES or total >= EXTRACT_MAX_BYTES:
+                break
+            if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
+                continue                       # skip links/devices (traversal)
+            if not _within(dest, m.name):
+                continue
+            if m.isfile():
+                total += max(m.size, 0)
+            try:
+                tf.extract(m, dest)
+            except Exception:
+                continue
+            files += 1
+
+
+def _extract_zip(data: bytes, dest: str) -> None:
+    import io
+    import zipfile
+    files = total = 0
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if files >= EXTRACT_MAX_FILES or total >= EXTRACT_MAX_BYTES:
+                break
+            if not _within(dest, info.filename):
+                continue
+            total += info.file_size
+            try:
+                zf.extract(info, dest)
+            except Exception:
+                continue
+            files += 1
+
+
+def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
+    fetched = 0
+    for name in names[:FETCH_MAX_PKGS]:
+        url = None
+        if ecosystem == "pypi":
+            meta = pypi_metadata(name)
+            if not meta or meta.get("__http__"):
+                if meta and meta.get("__http__") == 404:
+                    emit("HIGH", "pkg-missing", name, 0,
+                         f"package '{name}' does not exist on PyPI - possible "
+                         f"dependency-confusion / typo")
+                continue
+            urls = meta.get("urls") or []
+            pick = next((u for u in urls if u.get("packagetype") == "bdist_wheel"), None) \
+                or next((u for u in urls if u.get("packagetype") == "sdist"), None)
+            url = pick.get("url") if pick else None
+        elif ecosystem == "npm":
+            meta = npm_metadata(name)
+            if not meta or meta.get("__http__"):
+                if meta and meta.get("__http__") == 404:
+                    emit("HIGH", "pkg-missing", name, 0,
+                         f"package '{name}' does not exist on the npm registry - "
+                         f"possible dependency-confusion / typo")
+                continue
+            latest = (meta.get("dist-tags") or {}).get("latest") or ""
+            ver = (meta.get("versions") or {}).get(latest, {})
+            url = ((ver.get("dist") or {}).get("tarball"))
+        if not url:
+            continue
+        data = http_get_bytes(url, FETCH_ARTIFACT_MAX)
+        if data is None:
+            emit("LOW", "pkg-uninspected", name, 0,
+                 f"could not fetch '{name}' for inspection (too large or "
+                 f"unreachable) - install was not content-scanned")
+            continue
+        outdir = os.path.join(dest, re.sub(r"[^A-Za-z0-9._@-]", "_", name))
+        os.makedirs(outdir, exist_ok=True)
+        try:
+            if url.endswith((".whl", ".zip", ".egg")):
+                _extract_zip(data, outdir)
+            else:
+                _extract_tar(data, outdir)
+            fetched += 1
+        except Exception:
+            continue
+    return fetched
+
+
+# --------------------------------------------------------------------------- #
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="sanitycheck_deep.py", add_help=True)
-    ap.add_argument("root")
+    ap.add_argument("root", nargs="?")
     ap.add_argument("--resolve", action="store_true",
                     help="also walk the transitive PyPI dependency graph (network)")
     ap.add_argument("--iocs", default=None, help="IOC db for known-malicious names")
+    ap.add_argument("--fetch", choices=["pypi", "npm"],
+                    help="download+extract named packages into --dest for scanning")
+    ap.add_argument("--dest", help="destination dir for --fetch")
+    ap.add_argument("names", nargs="*", help="package names for --fetch")
     args = ap.parse_args(argv[1:])
 
+    # fetch mode: download + extract registry packages (no execution) so the
+    # shell can scan their real contents. argparse puts the first positional in
+    # `root`, so reassemble all positionals as the package-name list.
+    if args.fetch:
+        names = ([args.root] if args.root else []) + (args.names or [])
+        if args.dest and names:
+            fetch_packages(args.fetch, args.dest, names)
+        return 0
+
+    if not args.root:
+        return 0
     root = Path(args.root).resolve()
     if not root.is_dir():
         return 0  # stay silent so the shell tool is unaffected
