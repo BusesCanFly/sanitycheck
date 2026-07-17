@@ -516,7 +516,7 @@ detect_iocs() {
       local i=0 s
       for s in "${IOC_SHA[@]}"; do
         if [[ "$h" == "$s" ]]; then
-          add_finding CRIT ioc-hash "$art" 0 "File hash matches known ChocoPoC payload - ${IOC_SHA_NOTE[$i]:-IOC}"
+          add_finding CRIT ioc-hash "$art" 0 "File hash matches a known malicious payload - ${IOC_SHA_NOTE[$i]:-IOC}"
         fi
         i=$((i+1))
       done

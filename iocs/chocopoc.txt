@@ -6,7 +6,7 @@
 # Format: TYPE<TAB>VALUE<TAB>NOTE
 # TYPE is one of:
 #   pkg     - known malicious PyPI package name (matched against declared/vendored deps)
-#   sha256  - known malicious file hash (matched against .so/.pyd/.whl/.tar.gz in tree)
+#   sha256  - known malicious file hash (matched against binaries/archives in tree)
 #   env     - anti-recursion / gating environment variable name (matched in source)
 #   str     - literal string / magic constant unique to the campaign
 #   host    - C2 / abused infrastructure indicator
@@ -39,3 +39,13 @@ host	91.132.163.78	ChocoPoC secondary exfiltration server
 host	api.mapbox.com	Legitimate API abused for C2 tasking / exfil (SNI-fronted)
 host	frankley	Mapbox account name used for C2 (created ~2026-04-19)
 host	mattallahsaed	Second Mapbox account name used for C2
+host	james09790	Third Mapbox account name used for C2
+
+# Additional ChocoPoC IOCs from the full Sekoia writeup
+str	/assets/static/bundle.ext.min.de5b2bc9.js	ChocoPoC exfil endpoint path on 91.132.163.78:8001
+str	PTsjBGKQUxZorq2	Value of the ZEBUWIAKGPHOQAP006 anti-recursion env var
+str	JKHKJ23VAS8DF9	Value of the JKHWQVEKRASDF12 anti-recursion env var
+str	pk.eyJ1IjoiZnJhbmtsZXkiLCJhIjoiY21vNzFzaXNzMDJrMjJxcHJqY3JscnlpYSJ9.fuMfMgsxlOGxRy44A-y0WQ	Mapbox public token (frankley) used for C2
+str	pk.eyJ1IjoibWF0dGFsbGFoc2FlZCIsImEiOiJjbWlzbWpncWkwNHRmM2ZzMWd1eTBmanQ4In0.VNFutzqzaSVfDiwQFr7_gQ	Mapbox public token (mattallahsaed) used for C2
+str	sk.eyJ1IjoicmRyYWEiLCJhIjoiY21pMmo1bWFrMTJvOTJscjRsenlqOWwydCJ9.vGHDYdHYNEm9jj4JbOgTyw	Mapbox secret token (rdraa) leaked in payload
+str	sk.eyJ1IjoiamFtZXMwOTc5MCIsImEiOiJjbWoxM3JuNHQwYnh0M2xxeWhsMnVyaDZwIn0.ELpete7yVGAeg52Mrmt2DA	Mapbox secret token (james09790) leaked in payload
