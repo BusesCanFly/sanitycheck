@@ -204,49 +204,49 @@ load_rules() {
 
   # native-extension import shadowing (the core ChocoPoC trick; loaders here)
   rule HIGH native-load  "*.py *.pyx"      'ctypes\.(CDLL|WinDLL|cdll|windll)|cffi|LoadLibrary' \
-       'Loads a native library directly - compiled payloads evade source review'
+       'Loads a native library directly (ctypes/cffi/LoadLibrary) - the loaded code is not visible to source review'
 
   # environmental gating / anti-analysis
   rule HIGH env-gating   "*.py *.pyx"      'EXPLOIT_POC|0xF4835C9C' \
-       'Gates behaviour on a specific PoC filename - classic sandbox-evasion detonation trigger'
+       'Gates behaviour on a specific filename/constant - runs only in the intended target, not under review'
   rule MED  self-inspect "*.py *.pyx"      'hash\([^)]*(__file__|basename)|__file__[^\n]{0,40}==[^\n]{0,20}0x|for\s+\w+\s+in\s+(list\()?sys\.modules' \
-       'Hashes its own filename or iterates loaded modules - used to detonate only for real victims'
+       'Hashes its own filename or inspects loaded modules - fingerprints its runtime to run only in a specific environment'
   rule MED  anti-debug   "*.py *.pyx *.c"  'CheckRemoteDebuggerPresent|IsDebuggerPresent|GetThreadContext|ptrace\(' \
-       'Anti-debugging check - hallmark of malware, not of a PoC'
+       'Anti-debugging check (IsDebuggerPresent/ptrace) - detects or blocks a debugger'
   rule MED  sandbox-check "*.py *.pyx"     'platform\.node|getpass\.getuser|hostname.*(sandbox|vmware|virtualbox)' \
-       'Environment fingerprinting - may refuse to run under analysis'
+       'Environment fingerprinting - checks hostname/user, may refuse to run under analysis'
 
   # obfuscation / dynamic execution
   rule HIGH pack-exec    "*.py *.pyx"      '(marshal\.loads|zlib\.decompress|lzma\.decompress|codecs\.decode).*(exec|eval)|exec\(.*decompress|exec\(.*b64decode' \
-       'Decodes/decompresses then executes a blob - packed payload'
+       'Decodes or decompresses data and then executes it'
   rule MED  dyn-exec     "*.py *.pyx"      'exec\(|eval\(|__import__\(|compile\(.*exec' \
-       'Dynamic code execution'
+       'Dynamic code execution (exec/eval/compile/__import__)'
   rule MED  decode       "*.py *.pyx"      'base64\.b(64|85|32)decode|bytes\.fromhex|codecs\.decode.*rot' \
-       'Decodes encoded data (base64/hex/rot13) - common payload wrapper'
+       'Decodes encoded data (base64/hex/rot13)'
   rule LOW  blob         "*.py *.pyx *.txt" '[A-Za-z0-9+/]{220,}={0,2}' \
-       'Very long encoded literal - possible embedded payload'
+       'Very long base64-like literal - could be embedded data'
   rule MED  hex-blob     "*.py *.pyx"      '(\\x[0-9a-fA-F]{2}){40,}' \
        'Long \\xNN byte string - possible shellcode/obfuscated data'
 
   # shell / command execution
   rule MED  shell-exec   "*.py *.pyx"      'os\.system\(|os\.popen\(|subprocess\.[A-Za-z_]+\([^)]*shell\s*=\s*True|pty\.spawn|commands\.getoutput' \
-       'Executes shell commands'
+       'Executes shell commands (os.system / subprocess shell=True / pty.spawn)'
   rule LOW  net-exec     "*.py *.pyx"      'urllib.*urlopen|requests\.(get|post)|socket\.socket|http\.client' \
-       'Makes network connections'
+       'Makes network connections (urllib / requests / raw socket)'
 
   # credential / data harvesting
   rule HIGH harvest      "*.py *.pyx"      'Login Data|cookies\.sqlite|key4\.db|logins\.json|os_crypt|Local State|Keychain|_distutils' \
-       'Reads browser credential/cookie stores - data theft'
+       'Reads browser credential/cookie stores (Login Data / key4.db / cookies)'
   rule HIGH keychain-cli "$ANY"            'security\s+find-generic-password|login\.keychain|secretstorage' \
-       'Extracts OS keychain / secret-store credentials'
+       'Reads the OS keychain / secret store (macOS Keychain / libsecret)'
   rule HIGH wallet       "$ANY"            'wallet\.dat|MetaMask|Electrum|Exodus|Ethereum/keystore|\.config/solana' \
-       'Accesses cryptocurrency wallet files - wallet stealer behaviour'
+       'Reads cryptocurrency wallet files (wallet.dat / MetaMask / Electrum)'
   rule MED  histfiles    "*.py *.pyx"      '\.bash_history|\.zsh_history|\.ssh/id_[rd]sa|\.aws/credentials|\bid_rsa\b' \
-       'Reads shell history / SSH / cloud credential files'
+       'Reads shell history / SSH keys / cloud credential files'
 
   # surveillance
   rule HIGH keylog       "$ANY"            'pynput\.keyboard|GetAsyncKeyState|SetWindowsHookEx|keyboard\.on_press|CGEventTap' \
-       'Keylogging / input-hooking API - surveillance, not exploitation'
+       'Keylogging / input-hooking API (pynput / SetWindowsHookEx / CGEventTap)'
   rule MED  screencap    "$ANY"            'ImageGrab\.grab|\bmss\(\)|screencapture\b|\bscrot\b' \
        'Screen capture - confirm captures are not exfiltrated'
 
@@ -282,7 +282,7 @@ load_rules() {
        'Cryptocurrency miner reference'
   rule HIGH backdoor-acct "$ANY Makefile" \
        'useradd\b[^\n]{0,60}(-o\s+-u\s*0|-G\s+(sudo|wheel))|net\s+user\b[^\n]{0,40}/add|net\s+localgroup\b[^\n]{0,40}/add' \
-       'Creates a new (possibly privileged) user account - backdoor'
+       'Creates a new user account with uid 0 or sudo/wheel/admin group'
   rule MED  exfil-channel "$ANYPLUS" \
        'discord(app)?\.com/api/webhooks|hooks\.slack\.com/services|pastebin\.com/(api|raw)|api\.telegram\.org/bot|https?://t\.me/|transfer\.sh|0x0\.st|termbin\.com' \
        'Exfiltration channel (webhook / paste / telegram / anonymous upload)'
@@ -303,10 +303,10 @@ load_rules() {
        'VS Code task set to auto-run on folder open - zero-click code execution when the repo is opened in the editor'
   rule HIGH vs-buildevent "*.vcxproj *.csproj *.vbproj *.targets *.props" \
        'PreBuildEvent|PostBuildEvent|<Exec\s|Command>[^<]*(cmd|powershell|pwsh|bash|curl|wget|mshta)' \
-       'Visual Studio project runs a command at build time (Lazarus researcher-targeting vector - malicious .vcxproj/DLL)'
+       'Visual Studio project runs a command at build time (PreBuildEvent/PostBuildEvent/Exec) - runs when the project is built'
   rule HIGH shellcode    "*.py *.pyx *.c *.cs *.go *.js" \
        'VirtualAllocEx?|VirtualProtect|WriteProcessMemory|CreateRemoteThread|NtUnmapViewOfSection|mmap\([^)]*PROT_EXEC|PROT_EXEC[^)]*PROT_WRITE|ctypes\.cast\([^)]*CFUNCTYPE' \
-       'Allocates executable memory / injects into a process - shellcode runner'
+       'Allocates executable memory or writes into another process (VirtualAlloc/mmap PROT_EXEC/WriteProcessMemory)'
   rule LOW  pickle-exec  "*.py *.pyx" \
        'pickle\.loads|cPickle\.loads|jsonpickle\.decode' \
        'Unpickling untrusted data can execute code - verify the source is trusted'
@@ -352,7 +352,7 @@ detect_native_shadowing() {
         "Compiled '$base' shadows '$stem.py' in the same package - the binary imports instead of the source you can read"
     else
       add_finding HIGH native-vendored "$so" 0 \
-        "Vendored compiled extension '$base' - review or hash-check; ChocoPoC hid its payload in one"
+        "Vendored compiled extension '$base' - binary, not reviewable as source; verify it by hash"
     fi
   done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' \) 2>/dev/null || true)
 }
@@ -500,11 +500,12 @@ detect_iocs() {
   done
   if [[ ${#pat[@]} -gt 0 ]]; then
     local joined; joined="$(printf '%s|' "${pat[@]}")"; joined="${joined%|}"
+    # -o prints the matched IOC itself, so the finding can name it (file:line:match)
     while IFS= read -r hit; do
       [[ -z "$hit" ]] && continue
-      local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
-      add_finding CRIT ioc-str "$file" "$line" "Contains ChocoPoC IOC string (env marker / magic constant / C2 host)"
-    done < <(grep -rInaE "${GREP_EXCLUDES[@]}" -- "$joined" "$ROOT" 2>/dev/null | head -n 20 || true)
+      local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"; local match="${rest#*:}"
+      add_finding CRIT ioc-str "$file" "$line" "Contains known IOC marker '$match' (from the IOC database)"
+    done < <(grep -rInaoE "${GREP_EXCLUDES[@]}" -- "$joined" "$ROOT" 2>/dev/null | head -n 20 || true)
   fi
   if [[ ${#IOC_SHA[@]} -gt 0 ]]; then
     local art

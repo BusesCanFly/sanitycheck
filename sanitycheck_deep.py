@@ -214,7 +214,7 @@ def scan_python(path: Path, root: Path) -> None:
             if contains_decode_then_exec(node):
                 emit("HIGH", "ast-decode-exec", rp, node.lineno,
                      "Decoded/decompressed data passed straight to exec/eval - "
-                     "the canonical 'unpack payload and run it' pattern")
+                     "unpacks data and runs it")
 
 
 def scan_unicode(path: Path, root: Path) -> None:
