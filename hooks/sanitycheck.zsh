@@ -4,7 +4,7 @@
 #   1. running a  curl|bash  installer   (zsh only, via the zle line editor)
 #   2. right after  git clone <url>      -> FAST static scan of the checkout
 #   3. right before installing deps      -> DEEP scan (with dependency resolution):
-#        pip, pip3, npm, yarn, pnpm, poetry, uv
+#        pip, pip3, pipx, npm, yarn, pnpm, poetry, uv
 #
 # clone=fast, install=deep: a fresh clone hasn't pulled dependencies yet, and a
 # malicious build script (Makefile, build.rs, setup.py, ...) is already caught by
@@ -31,6 +31,42 @@ _sanitycheck_bin() { command -v "$SANITYCHECK_BIN" 2>/dev/null || echo ""; }
 # expands to "--fast" when SANITYCHECK_HOOK_FAST is set, otherwise nothing
 _sc_fast() { [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && printf -- '--fast'; }
 
+# One "sanitycheck:" label for every message, so wording and color match across
+# the curl|bash, git-clone, and install-guard paths. Yellow on a color terminal;
+# plain when NO_COLOR is set or stderr is not a tty.
+_sc_label() {
+  if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then printf '\033[33msanitycheck:\033[0m'
+  else printf 'sanitycheck:'; fi
+}
+# a status/aborted line: "sanitycheck: <msg>" on its own line
+_sc_say() { printf '%s %s\n' "$(_sc_label)" "$1" >&2; }
+
+# Read a single keypress from the terminal without echoing it, then print one
+# newline ourselves. Silent read (-s) is what makes spacing deterministic: the
+# terminal no longer echoes the key (which happened or not depending on tty
+# mode), so every path prints exactly one line break after the prompt.
+_sc_readkey() {  # -> echoes the key
+  local ans=""
+  if [[ -n "${ZSH_VERSION:-}" ]]; then read -rsk1 ans </dev/tty 2>/dev/null || ans=""
+  else read -rsn1 ans </dev/tty 2>/dev/null || ans=""; fi
+  printf '\n' >&2
+  printf '%s' "$ans"
+}
+# Ask a yes-default question, same style everywhere: "sanitycheck: <q> [Y/n] ".
+# Enter (or anything but n) proceeds. No terminal -> nobody to ask, so proceed
+# with the automatic scan (scripts stay covered and never hang on a read).
+_sc_ask() {  # question -> 0 = yes/proceed, 1 = no/skip
+  [[ -t 0 && -t 2 ]] || return 0
+  printf '%s %s [Y/n] ' "$(_sc_label)" "$1" >&2
+  [[ "$(_sc_readkey)" != [Nn] ]]
+}
+# Ask a no-default question (for the "run it anyway?" confirm after DANGEROUS).
+_sc_ask_risky() {  # question -> 0 = yes/proceed, 1 = no/abort
+  [[ -t 0 && -t 2 ]] || return 1        # non-interactive: refuse by default
+  printf '%s %s [y/N] ' "$(_sc_label)" "$1" >&2
+  [[ "$(_sc_readkey)" == [Yy] ]]
+}
+
 # --- 1. curl|bash interception (zsh only; needs the zle line editor) ----------
 if [[ -n "${ZSH_VERSION:-}" ]]; then
   _sanitycheck_match() {
@@ -46,15 +82,23 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
   _sanitycheck_accept_line() {
     if [[ "$SANITYCHECK_HOOK" == "1" ]] && command -v "$SANITYCHECK_BIN" >/dev/null 2>&1 \
        && _sanitycheck_match "$BUFFER"; then
-      local orig="$BUFFER"
+      local orig="$BUFFER" answer
+      # We are about to write to the terminal from inside a widget: invalidate
+      # zle's display first, or the next redraw lands at a stale cursor
+      # position and smears across the [Y/n] line.
+      zle -I
       echo ""
-      printf '\033[33msanitycheck:\033[0m audit this before running? [Y/n] '
-      read -rk1 answer
-      echo ""
-      case "$answer" in
-        [Nn]) BUFFER="$orig" ;;
-        *)    BUFFER="${SANITYCHECK_BIN} -r $(printf '%q' "$orig")" ;;
-      esac
+      printf '%s audit this before running? [Y/n] ' "$(_sc_label)"
+      read -rsk1 answer; echo ""
+      if [[ "$answer" != [Nn] ]]; then
+        # Run the audit right here instead of rewriting BUFFER: zle displays
+        # whatever buffer it accepts, and echoing a `sanitycheck -r '...'`
+        # one-liner (plus a redrawn prompt) reads as clutter. History keeps the
+        # command the user actually typed.
+        print -s -- "$orig"
+        BUFFER=""
+        "$SANITYCHECK_BIN" -r "$orig" </dev/tty
+      fi
     fi
     zle .accept-line
   }
@@ -70,14 +114,17 @@ fi
 # packages are fetched by the tool itself (their install scripts can't be seen
 # until download), so we vet the local project/target - its manifests (for the
 # transitive resolve) and its own lifecycle scripts - up front.
-_sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-project(0|1)  args...
+_sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args...
   local bin; bin="$(_sanitycheck_bin)"
-  local cmd="$1" trig="$2" project="$3"; shift 3
+  local cmd="$1" trig="$2" project="$3" skip="$4"; shift 4
   [[ "$SANITYCHECK_HOOK" == "1" && -n "$bin" ]] || { command "$cmd" "$@"; return $?; }
-  # walk the args once: the subcommand (first non-flag), an explicit local target
-  # (a path, `-r <reqfile>`, or `-e <path>`), and whether a *named* registry
-  # package was requested.
-  local sub="" target="" prev="" seen=0 a
+  # walk the args once: skip `skip` leading non-flag tokens that are part of the
+  # command itself (e.g. the "pip" in `uv pip install`), then read the subcommand
+  # (next non-flag), an explicit local target (a path, `-r <reqfile>`, or
+  # `-e <path>`), and any *named* registry packages.
+  # `cmd` stays the real executable (for `command "$cmd" ...`); `disp` is the
+  # human name, which grows to include skipped tokens like "uv pip".
+  local sub="" target="" prev="" seen=0 skipped=0 a disp="$cmd"
   local -a pkgs; pkgs=()
   for a in "$@"; do
     if [[ "$a" == -* ]]; then prev="$a"; continue; fi
@@ -85,6 +132,7 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
       -r|--requirement) [[ -f "$a" ]] && target="$(dirname "$a")"; prev="$a"; continue ;;
       -e|--editable)    [[ -e "$a" ]] && target="$a"; prev="$a"; continue ;;
     esac
+    if (( skipped < skip )); then disp="$disp $a"; skipped=$((skipped+1)); prev="$a"; continue; fi
     if [[ "$seen" == 0 ]]; then
       sub="$a"; seen=1
     else
@@ -105,17 +153,18 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
   # bare project install (no path, no named pkg) audits the cwd project
   [[ -z "$target" && "$project" == 1 && ${#pkgs[@]} -eq 0 ]] && target="."
 
-  local rc=0 what="$cmd${sub:+ $sub}"
+  local rc=0 what="$disp${sub:+ $sub}"
   if [[ -n "$target" && -e "$target" ]]; then
     # a local project/path -> full scan
-    echo "sanitycheck: scanning '$target' before $what..." >&2
+    _sc_ask "audit '$target' before $what?" || { command "$cmd" "$@"; return $?; }
     "$bin" $(_sc_fast) "$target"; rc=$?          # deep unless SANITYCHECK_HOOK_FAST
   elif [[ ${#pkgs[@]} -gt 0 ]]; then
-    # named registry package(s) -> vet the NAME(s) against IOCs and, when online,
-    # download+scan the actual package contents (no cwd scan). Silent unless
-    # something is flagged.
+    # named registry package(s) -> check the NAME(s) against IOCs and, when
+    # online, download+scan the actual package contents (no cwd scan). Silent
+    # unless something is flagged.
+    _sc_ask "audit ${pkgs[*]} before $what?" || { command "$cmd" "$@"; return $?; }
     local eco=""
-    case "$cmd" in pip|pip3|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; esac
+    case "$cmd" in pip|pip3|pipx|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; esac
     local -a cka; cka=(--check-pkg)
     [[ -n "$eco" ]] && cka+=(--ecosystem "$eco")
     [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
@@ -126,11 +175,9 @@ _sc_install_guard() {  # display-cmd  trigger-subcommand-ere  installs-cwd-proje
 
   if [[ $rc -eq 1 ]]; then                         # exit 1 == DANGEROUS
     if [[ "${SANITYCHECK_HOOK_STRICT:-0}" == "1" ]]; then
-      echo "sanitycheck: DANGEROUS - $what aborted." >&2; return 1
+      _sc_say "$what aborted (DANGEROUS)."; return 1
     fi
-    printf 'sanitycheck: DANGEROUS verdict. Run %s anyway? [y/N] ' "$what" >&2
-    local ans; read -r ans
-    [[ "$ans" == [yY]* ]] || { echo "aborted." >&2; return 1; }
+    _sc_ask_risky "DANGEROUS - run $what anyway?" || { _sc_say "$what aborted."; return 1; }
   fi
   command "$cmd" "$@"
 }
@@ -161,21 +208,28 @@ git() {
     dest="$(basename "${dest%.git}")"
   fi
   [[ -d "$dest" ]] || return 0
-  echo "sanitycheck: scanning freshly cloned '$dest'..." >&2
+  _sc_ask "audit '$dest'?" || return 0
   "$bin" --fast "$dest" || true      # clone=fast: dependencies aren't pulled yet
   return 0
 }
 
-pip()    { _sc_install_guard pip    'install'          0 "$@"; }
-pip3()   { _sc_install_guard pip3   'install'          0 "$@"; }
-npm()    { _sc_install_guard npm    'install|i|ci|add' 1 "$@"; }
-yarn()   { _sc_install_guard yarn   'install|add'      1 "$@"; }
-pnpm()   { _sc_install_guard pnpm   'install|i|add'    1 "$@"; }
-poetry() { _sc_install_guard poetry 'install|add|sync' 1 "$@"; }
-uv()     { _sc_install_guard uv     'sync|add|pip'     1 "$@"; }
+pip()    { _sc_install_guard pip    'install'             0 0 "$@"; }
+pip3()   { _sc_install_guard pip3   'install'             0 0 "$@"; }
+pipx()   { _sc_install_guard pipx   'install|inject|run'  0 0 "$@"; }
+npm()    { _sc_install_guard npm    'install|i|ci|add' 1 0 "$@"; }
+yarn()   { _sc_install_guard yarn   'install|add'      1 0 "$@"; }
+pnpm()   { _sc_install_guard pnpm   'install|i|add'    1 0 "$@"; }
+poetry() { _sc_install_guard poetry 'install|add|sync' 1 0 "$@"; }
+uv() {
+  # uv has two shapes: native (`uv add|sync|lock`) and a pip passthrough
+  # (`uv pip install|sync ...`). For the latter, skip the leading "pip" token so
+  # the subcommand and package names parse correctly.
+  if [[ "${1:-}" == pip ]]; then _sc_install_guard uv 'install|sync' 0 1 "$@"
+  else _sc_install_guard uv 'sync|add|lock' 1 0 "$@"; fi
+}
 # add another manager in one line, e.g.:
-# bundle()   { _sc_install_guard bundle 'install' 1 "$@"; }
-# composer() { _sc_install_guard composer 'install|require|update' 1 "$@"; }
+# bundle()   { _sc_install_guard bundle 'install' 1 0 "$@"; }
+# composer() { _sc_install_guard composer 'install|require|update' 1 0 "$@"; }
 
 [[ "${_sc_realias:-0}" == "1" ]] && setopt aliases
 unset _sc_realias

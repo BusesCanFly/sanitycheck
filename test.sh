@@ -120,8 +120,53 @@ gsrc=$(mktemp -d); gdstp=$(mktemp -d); cp -R "$FIX/chocopoc-lookalike/." "$gsrc/
 ( cd "$gsrc" && git init -q && git add -A && git -c commit.gpgsign=false \
     -c user.email=a@b -c user.name=a commit -qm x --no-verify ) >/dev/null 2>&1
 gout=$(env SANITYCHECK_BIN="$wrapd/sc" SANITYCHECK_HOOK=1 bash -c "source '$HERE/hooks/sanitycheck.zsh'; git clone -q '$gsrc' '$gdstp/c' 2>&1" </dev/null)
-[[ "$gout" == *"scanning freshly cloned"* && "$gout" == *DANGEROUS* ]] && pass "git clone scans the checkout" || fail "git clone wrapper"
+# no tty on stdin -> the hook must scan automatically, without a [Y/n] prompt
+[[ "$gout" == *DANGEROUS* && "$gout" != *"[Y/n]"* ]] && pass "git clone scans the checkout" || fail "git clone wrapper"
 rm -rf "$htmp" "$fbin" "$wrapd" "$gsrc" "$gdstp"
+
+echo "hook: install trigger routing (which subcommands scan, and with what args)"
+# A stub sanitycheck that just prints how it was invoked, plus stub managers, so
+# we can assert each wrapper routes the right subcommands to a scan with the
+# right ecosystem/target/package args. Non-interactive (stdin closed) -> the
+# [Y/n] prompt auto-proceeds, so this exercises routing without a pty.
+trh=$(mktemp -d)
+printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$trh/sc"; chmod +x "$trh/sc"
+for m in npm yarn pnpm poetry uv pip pip3 pipx; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
+mkdir -p "$trh/proj"; printf '{"name":"p"}\n' >"$trh/proj/package.json"; printf 'requests\n' >"$trh/proj/requirements.txt"
+route() { # expected-substring-or-'PASS'  command...
+  local want="$1"; shift
+  local got; got=$(cd "$trh/proj" && SANITYCHECK_BIN="$trh/sc" SANITYCHECK_HOOK=1 PATH="$trh:$PATH" \
+    bash -c "source '$HERE/hooks/sanitycheck.zsh'; $*" </dev/null 2>&1)
+  local scan; scan=$(printf '%s' "$got" | sed -n 's/^SCAN //p')
+  if [[ "$want" == PASSTHROUGH ]]; then
+    [[ -z "$scan" ]] && pass "no scan: $*" || fail "unexpected scan for '$*' -> $scan"
+  else
+    [[ "$scan" == *"$want"* ]] && pass "routes '$*' -> $want" || fail "'$*' routed to '$scan' (want *$want*)"
+  fi
+}
+route "--ecosystem npm leftpad"   npm install leftpad
+route "--ecosystem npm leftpad"   npm i leftpad
+route "."                          npm ci
+route "--ecosystem npm leftpad"   npm add leftpad
+route PASSTHROUGH                  npm run build
+route "--ecosystem npm leftpad"   yarn add leftpad
+route "--ecosystem npm leftpad"   pnpm add leftpad
+route "--ecosystem pypi requests" pip install requests
+route "."                          pip install -r requirements.txt
+route "."                          pip install .
+route PASSTHROUGH                  pip download requests
+route PASSTHROUGH                  pip list
+route "--ecosystem pypi black"    pipx install black
+route "--ecosystem pypi httpie"   pipx run httpie
+route PASSTHROUGH                  pipx list
+route "--ecosystem pypi evil"     poetry add evil
+route "."                          poetry install
+route "--ecosystem pypi x"        uv add x
+route "."                          uv sync
+route "--ecosystem pypi x y"      uv pip install x y      # the "pip" token is skipped
+route "."                          uv pip install -r requirements.txt
+route PASSTHROUGH                  uv run script
+rm -rf "$trh"
 
 if command -v zsh >/dev/null 2>&1; then
   echo "hook: curl|bash matcher (zsh POSIX-ERE)"
@@ -137,8 +182,74 @@ fi
 echo "check-pkg: named-install name vetting (offline name match, no dir scan)"
 "$SC" --offline --check-pkg frint >/dev/null 2>&1; eq "known-malicious name -> exit 1" "$?" "1"
 "$SC" --offline --check-pkg lodash requests >/dev/null 2>&1; eq "clean names -> exit 0" "$?" "0"
-cpo="$("$SC" --offline --check-pkg lodash 2>&1)"; [[ -z "$cpo" ]] && pass "clean name is silent" || fail "clean name printed output"
+cpo="$("$SC" --offline --check-pkg lodash 2>&1)"; [[ -z "$cpo" ]] && pass "clean name is silent when piped (auto scan)" || fail "clean name printed output when piped"
+# ...but interactive (stdout is a tty) prints a one-line SAFE confirmation
+if command -v script >/dev/null 2>&1; then
+  cptty=$(mktemp)
+  if script --version >/dev/null 2>&1; then script -qec "'$SC' --offline --check-pkg lodash" "$cptty" >/dev/null 2>&1
+  else script -q "$cptty" "$SC" --offline --check-pkg lodash >/dev/null 2>&1; fi
+  grep -q "lodash — SAFE" "$cptty" && pass "clean name prints SAFE confirmation on a tty" || fail "no SAFE confirmation on tty"
+  rm -f "$cptty"
+fi
 "$SC" --offline --check-pkg sky-text >/dev/null 2>&1; eq "separator variant (sky-text) -> exit 1" "$?" "1"
+"$SC" --offline --check-pkg --ecosystem npm skytext >/dev/null 2>&1; eq "npm ecosystem name match -> exit 1" "$?" "1"
+"$SC" --offline --check-pkg --ecosystem npm express >/dev/null 2>&1; eq "npm clean name -> exit 0" "$?" "0"
+
+echo "integration: installer mode (loopback-served fixtures, TP/TN)"
+if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  isrv=$(mktemp); python3 -c '
+import http.server, socketserver, sys, os
+os.chdir(sys.argv[1])
+with socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler) as h:
+    print(h.server_address[1], flush=True); h.serve_forever()
+' "$FIX/installers" >"$isrv" 2>/dev/null &
+  ISRV=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$isrv" ]] && break; sleep 0.2; done
+  IPORT="$(head -1 "$isrv")"
+  if [[ -n "$IPORT" ]]; then
+    "$SC" --offline "curl -fsSL http://127.0.0.1:$IPORT/benign.sh | bash" >/dev/null 2>&1
+    eq "benign installer -> exit 0 (not DANGEROUS)" "$?" "0"
+    ij="$("$SC" --offline --json "curl -fsSL http://127.0.0.1:$IPORT/malicious.sh | bash" 2>/dev/null)"
+    "$SC" --offline "curl -fsSL http://127.0.0.1:$IPORT/malicious.sh | bash" >/dev/null 2>&1
+    eq "malicious installer -> exit 1" "$?" "1"
+    iv="$(printf '%s' "$ij" | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])' 2>/dev/null)"
+    eq "malicious installer verdict" "$iv" "DANGEROUS"
+    it=" $(printf '%s' "$ij" | python3 -c 'import json,sys;print(" ".join(sorted({f["tag"] for f in json.load(sys.stdin)["findings"]})))' 2>/dev/null) "
+    [[ "$it" == *" ioc-str "* ]] && pass "installer IOC C2 host caught (CRIT survives demotion)" || fail "installer ioc-str missing"
+    [[ "$it" == *" reverse-shell "* ]] && pass "installer reverse-shell caught (HIGH survives demotion)" || fail "installer reverse-shell missing"
+  else
+    fail "installer test: loopback server did not start"
+  fi
+  kill "$ISRV" 2>/dev/null; wait "$ISRV" 2>/dev/null; rm -f "$isrv"
+else
+  echo "  (curl or python3 unavailable — skipping installer mode test)"
+fi
+
+echo "report: SAFE omits the findings-count line; non-SAFE includes it"
+rs="$("$SC" --offline "$FIX/benign-poc" 2>/dev/null)"
+[[ "$rs" == *"VERDICT: SAFE"* && "$rs" != *"findings:"* ]] && pass "SAFE report has no findings: line" || fail "SAFE report shape"
+rd="$("$SC" --offline "$FIX/chocopoc-lookalike" 2>/dev/null)"
+[[ "$rd" == *"findings:"* && "$rd" == *"VERDICT: DANGEROUS"* ]] && pass "DANGEROUS report has findings: line" || fail "DANGEROUS report shape"
+
+# Regression for the git-clone-scan-death bug: with the progress spinner active
+# (needs a tty) a scan longer than one spinner sweep used to die under set -e
+# before printing its verdict. Drive a real scan through a pty and require the
+# verdict to appear. SANITYCHECK_SPIN_INTERVAL speeds the sweep so it is crossed
+# deterministically on a fast fixture scan.
+echo "regression: long scan under active spinner still prints verdict (#spinner-set-e)"
+if command -v script >/dev/null 2>&1; then
+  ptylog=$(mktemp)
+  if script --version >/dev/null 2>&1; then          # util-linux
+    SANITYCHECK_SPIN_INTERVAL=0.001 script -qec "'$SC' --offline '$FIX/chocopoc-lookalike'" "$ptylog" >/dev/null 2>&1
+  else                                                # BSD/macOS
+    SANITYCHECK_SPIN_INTERVAL=0.001 script -q "$ptylog" "$SC" --offline "$FIX/chocopoc-lookalike" >/dev/null 2>&1
+  fi
+  grep -q "VERDICT: DANGEROUS" "$ptylog" && pass "verdict printed with spinner active" || fail "spinner death: no verdict under pty"
+  grep -q "auditing" "$ptylog" && pass "spinner actually ran" || fail "spinner never rendered (test not exercising the path)"
+  rm -f "$ptylog"
+else
+  echo "  (script unavailable — skipping spinner regression test)"
+fi
 
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"

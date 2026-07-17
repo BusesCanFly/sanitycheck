@@ -91,7 +91,7 @@ archive, or git URL), or a single source file. Runs every applicable check.
 ${B}USAGE${Z}
   $SELF [options] <curl|bash cmd | url | path | archive | git-url>
 
-${B}OPTIONS${Z}  (flags only subtract work; defaults do the most)
+${B}OPTIONS${Z}  (defaults run every applicable check; flags turn parts off)
   -r, --run             Offer to run an installer script after the audit
   --fast                Static checks only (skip network resolve + LLM)
   --offline             No network at all (implies --fast for network layers)
@@ -118,8 +118,6 @@ ${B}EXAMPLES${Z}
 ${B}EXIT CODES${Z}
   0  SAFE / CAUTION      1  DANGEROUS      2  error
   (with --strict, CAUTION exits 1 too)
-
-Never run untrusted code you have not read. Run PoCs in a throwaway VM.
 EOF
   exit 0
 }
@@ -676,7 +674,15 @@ run_llm() {
     [[ ${#seen[@]} -eq 0 ]] && { info "llm: nothing flagged to review"; return 0; }
   fi
 
+  # Static status line while the model runs (the LLM call can take several
+  # seconds with nothing else on screen). Deliberately NOT the animated spinner:
+  # the claude CLI must not share the terminal with it.
+  local llm_line=0
+  if [[ -t 2 && "$JSON" != "1" ]]; then
+    printf '  %sllm review%s (%s)...' "$C" "$Z" "$prov" >&2; llm_line=1
+  fi
   local raw; raw="$(llm_call "$prov" "$payload")"
+  [[ "$llm_line" == "1" ]] && printf '\r\033[K' >&2
   [[ -z "$raw" ]] && { info "llm: no response from $prov"; return 0; }
   parse_llm "$raw"
   LLM_PROVIDER="$prov"
@@ -698,10 +704,14 @@ sev_color() { case "$1" in CRIT|HIGH) printf '%s' "$R";; MED) printf '%s' "$Y";;
 report_human() {
   local n=${#F_SEV[@]}
   printf '\n%s== sanitycheck (%s) ==%s  %s\n' "$B" "$MODE" "$Z" "$D$TARGET$Z"
-  printf '%sfindings:%s %sCRIT %d%s  %sHIGH %d%s  %sMED %d%s  %sLOW %d%s\n' \
-    "$B" "$Z" "$R" "$N_CRIT" "$Z" "$R" "$N_HIGH" "$Z" "$Y" "$N_MED" "$Z" "$D" "$N_LOW" "$Z"
-  [[ -n "$LLM_SUMMARY" ]] && printf '%sllm (%s):%s %s\n' "$B" "${LLM_PROVIDER:-?}" "$Z" "$LLM_SUMMARY"
-  printf '\n'
+  local hdr=0
+  if [[ "$VERDICT" != "SAFE" ]]; then
+    printf '%sfindings:%s %sCRIT %d%s  %sHIGH %d%s  %sMED %d%s  %sLOW %d%s\n' \
+      "$B" "$Z" "$R" "$N_CRIT" "$Z" "$R" "$N_HIGH" "$Z" "$Y" "$N_MED" "$Z" "$D" "$N_LOW" "$Z"
+    hdr=1
+  fi
+  [[ -n "$LLM_SUMMARY" ]] && { printf '%sllm (%s):%s %s\n' "$B" "${LLM_PROVIDER:-?}" "$Z" "$LLM_SUMMARY"; hdr=1; }
+  [[ "$hdr" == "1" ]] && printf '\n'
 
   local order=(CRIT HIGH MED LOW INFO) want i
   for want in "${order[@]}"; do
@@ -725,9 +735,9 @@ report_human() {
   esac
   printf '\n%s%s VERDICT: %s %s\n' "$vc$B" "$vsym" "$VERDICT" "$Z"
   case "$VERDICT" in
-    DANGEROUS) printf '%s  Do not install or run this. Treat it as hostile.%s\n' "$R" "$Z" ;;
+    DANGEROUS) printf '%s  Do not install or run this.%s\n' "$R" "$Z" ;;
     CAUTION)   printf '%s  Read every flagged file before you install or run anything.%s\n' "$Y" "$Z" ;;
-    *)         printf '%s  Nothing suspicious found by static checks. Still read the code before running.%s\n' "$G" "$Z" ;;
+    *)         printf '%s  Nothing suspicious found by static checks.%s\n' "$G" "$Z" ;;
   esac
   echo
 }
@@ -791,19 +801,25 @@ WORK_DIR=""; ROOT=""; SCRIPT_FILE=""
 SPIN_PID=""
 start_spinner() {
   [[ -t 2 && "$JSON" != "1" ]] || return 0
-  ( w=10; pos=0; dir=1        # subshell: no `local` (invalid outside a function)
+  ( set +e                    # subshell inherits set -e, and ((pos+=dir))
+                              # returns 1 whenever the result is 0 - that
+                              # killed the spinner one full sweep in (~1.4s)
+    w=10; pos=0; dir=1        # subshell: no `local` (invalid outside a function)
     while :; do
       bar=""
       for ((i=0; i<w; i++)); do [[ "$i" == "$pos" ]] && bar+="*" || bar+="."; done
       printf '\r  %sauditing%s [%s]' "$C" "$Z" "$bar" >&2
       (( pos+=dir )); (( pos<=0 )) && dir=1; (( pos>=w-1 )) && dir=-1
-      sleep 0.08
+      sleep "${SANITYCHECK_SPIN_INTERVAL:-0.08}"   # env override is a test hook
     done ) &
   SPIN_PID=$!
 }
 stop_spinner() {
   [[ -n "$SPIN_PID" ]] || return 0
-  kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null || true
+  # `|| true` on the kill too: if the spinner is already gone (bash reaps
+  # background children), a bare failing kill takes the whole script - and the
+  # report - down with it under set -e.
+  kill "$SPIN_PID" 2>/dev/null || true; wait "$SPIN_PID" 2>/dev/null || true
   printf '\r\033[K' >&2
   SPIN_PID=""
 }
@@ -1009,6 +1025,7 @@ maybe_run_installer() {
 
 # --- main --------------------------------------------------------------------
 main() {
+  setup_colors   # usage/die can fire mid-parse; re-run after, once --no-color is known
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -r|--run)     RUN_AFTER=1; shift ;;
@@ -1048,6 +1065,11 @@ main() {
     VERDICT="$(static_verdict)"
     if [[ "$VERDICT" != "SAFE" ]]; then
       if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi
+    elif [[ "$JSON" != "1" && -t 1 ]]; then
+      # SAFE + interactive: close the loop with a one-line confirmation. Stays
+      # silent when output is piped/redirected (the automatic non-tty hook scan),
+      # so it adds no noise to scripts or CI.
+      printf '%s[+] %s — SAFE%s\n' "$G" "$TARGET" "$Z"
     fi
     case "$VERDICT" in
       DANGEROUS) exit 1 ;;
@@ -1068,10 +1090,11 @@ main() {
     audit_repo_or_file
   fi
 
+  stop_spinner   # clear the spinner before the (optional) LLM step, which has
+                 # its own UI and must not share the terminal with the spinner
   VERDICT="$(static_verdict)"
   run_llm
   [[ -n "$LLM_VERDICT" ]] && VERDICT="$(more_severe "$VERDICT" "$LLM_VERDICT")"
-  stop_spinner   # keep the spinner up through the whole audit, until the verdict
 
   if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi
 

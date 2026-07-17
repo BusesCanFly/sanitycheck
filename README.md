@@ -6,7 +6,7 @@
 
 Audit untrusted code before you run it. `sanitycheck` automatically scans `curl | bash` style installers, cloned PoC repos and their dependencies, pip/npm/etc installs, and single scripts as/before you run them. Then, it gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. (It never runs any code it checks)
 
-The goal is to provide a semblance of security checking / "best practice" without requiring any extra concious action/effort. Shell hooks catch the commands, and if no warnings are raised, allow them to run as normal.
+The goal is a baseline security check with no extra effort: shell hooks catch the commands, and anything not flagged runs as normal.
 
 <p align="center">
   <img src="demo.svg" alt="sanitycheck auditing a git clone, a pip install, a curl|bash installer, and direct usage — showing DANGEROUS, CAUTION, and SAFE verdicts" width="720">
@@ -38,11 +38,11 @@ With the shell hook enabled, sanitycheck audits automatically when you clone a r
 
 | Trigger | Scan |
 |---------|------|
-| `curl \| bash` command line (zsh) | offers to audit it before it runs |
+| `curl \| bash` command line (zsh) | audits the script before it runs |
 | `git clone <url>` | **fast** static scan of the fresh checkout |
-| `pip` / `pip3` / `npm` / `yarn` / `pnpm` / `poetry` / `uv` install | **deep** scan with dependency resolution; aborts on DANGEROUS |
+| `pip` / `pip3` / `pipx` / `npm` / `yarn` / `pnpm` / `poetry` / `uv` install | **deep** scan with dependency resolution; aborts on DANGEROUS |
 
-It picks the analysis from what you're doing, prints the verdict, and never installs, imports, builds, or runs the target.
+Each hook asks first (`[Y/n]`, Enter audits, `n` skips); without a terminal it scans automatically. It picks the analysis from what you're doing, prints the verdict, and never installs, imports, builds, or runs the target.
 
 Clone is fast because dependencies aren't pulled yet and build scripts are already scanned statically; resolution is saved for install, where deps are fetched and the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `gradle`) aren't hooked — that's what the clone scan is for.
 
@@ -101,8 +101,8 @@ sanitycheck exploit.py                                           # single file
 | `--strict` | Exit nonzero on `CAUTION` too (CI gate) |
 | `--json` | Machine-readable report |
 | `--ioc FILE` | Extra IOC database (repeatable) |
-| `-p, --provider P` | LLM provider (`auto`, `ollama`, `claude-api`, `openai`, `claude-cli`) |
-| `-m, --model NAME` | Model name |
+| `--provider P` | LLM provider (`auto`, `ollama`, `claude-api`, `openai`, `claude-cli`) |
+| `--model NAME` | Model name |
 | `-o, --output DIR` | Keep files in DIR instead of a tmpdir |
 | `-k, --keep` | Keep downloaded/extracted files |
 | `--no-color` | Disable color |
