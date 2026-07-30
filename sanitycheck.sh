@@ -43,6 +43,7 @@ MODEL="${SANITYCHECK_MODEL:-}"
 EXTRA_IOCS=()
 TARGET=""
 MODE=""             # installer | repo | file | pkgcheck  (auto-detected)
+ASAR_PASS=0          # scanning inside an unpacked .asar (see demote_for_mode)
 CHECK_PKG=0         # --check-pkg : vet named packages (name IOC + fetch/scan)
 ECOSYSTEM=""        # --ecosystem : pypi | npm  (registry to fetch --check-pkg from)
 PKG_NAMES=()
@@ -131,6 +132,20 @@ N_CRIT=0; N_HIGH=0; N_MED=0; N_LOW=0
 # severity. (Effectiveness includes staying trusted enough to be read.)
 demote_for_mode() { # tag sev  ->  echoes a possibly-lowered severity
   local tag="$1" sev="$2"
+  # Inside an unpacked .asar the subject is a built application, not a source
+  # tree about to be installed. Nothing in it runs at install time, and its
+  # bundled SDKs name credential paths as a matter of course - an AWS client
+  # mentions .aws/credentials because that is its job, and flagging it buries
+  # the findings that mean something. What survives is runtime behaviour and
+  # embedded payloads: reverse shells, fetch-and-run, IOC hits, import shadowing.
+  if [[ "$ASAR_PASS" == "1" ]]; then
+    case "$tag" in
+      secret-scrape|harvest|wallet|keychain-cli|histfiles|persistence|screencap|\
+      sandbox-check|self-inspect|anti-debug|timestomp|str-obf|lib-inject|\
+      native-vendored|native-load|js-shell-exec|shell-exec|dyn-exec|decode|hex-blob|\
+      install-hook|gyp-exec|dep-links|build-ext|registry-redirect) printf 'LOW'; return ;;
+    esac
+  fi
   if [[ "$MODE" == "installer" ]]; then
     # normal-for-installers patterns
     case "$tag" in
@@ -173,14 +188,27 @@ add_finding() { # sev tag file line msg
   esac
 }
 
-rel() { local p="$1"; printf '%s' "${p#"$ROOT"/}"; }
+# Display path for a finding. Files unpacked from an .asar live in the workdir,
+# which means nothing to the user, so they are reported against the archive they
+# came from: "Contents/Resources/app.asar!/index.js".
+ASAR_DIR=(); ASAR_LABEL=()
+rel() {
+  local p="$1" i
+  for ((i=0; i<${#ASAR_DIR[@]}; i++)); do
+    case "$p" in
+      "${ASAR_DIR[$i]}"/*) printf '%s!/%s' "${ASAR_LABEL[$i]}" "${p#"${ASAR_DIR[$i]}"/}"; return ;;
+    esac
+  done
+  printf '%s' "${p#"$ROOT"/}"
+}
 
 # --- content-rule engine -----------------------------------------------------
 RULE_SEV=(); RULE_TAG=(); RULE_GLOB=(); RULE_ERE=(); RULE_MSG=()
 rule() { RULE_SEV+=("$1"); RULE_TAG+=("$2"); RULE_GLOB+=("$3"); RULE_ERE+=("$4"); RULE_MSG+=("$5"); }
 
 SH="*.sh *.bash *.zsh *.command Makefile *.mk"
-ANY="*.py *.pyx *.sh *.bash *.rb *.pl *.php *.js *.ts *.go *.c *.ps1"
+ANY="*.py *.pyx *.sh *.bash *.command *.rb *.pl *.php *.js *.mjs *.cjs *.ts *.go *.c *.ps1"
+JS="*.js *.mjs *.cjs *.ts"
 # ANY plus build-system files that execute on build/install (gradle=Groovy,
 # build.rs=cargo, Rakefile/extconf.rb/Gemfile=ruby, build.sbt=scala).
 ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile"
@@ -195,12 +223,15 @@ GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv
 
 load_rules() {
   # install-time code execution (pip/npm runs this; the #1 supply-chain vector)
-  rule HIGH install-hook "setup.py"        'cmdclass\s*=|class .*\(.*install.*\):|PostInstall|def run\(self\)' \
+  rule HIGH install-hook "setup.py"        'cmdclass\s*=|class .{0,60}\(.{0,40}install.{0,20}\):|PostInstall|def run\(self\)' \
        'setup.py defines an install-time hook (cmdclass/custom install) - runs code on "pip install"'
   rule MED  dep-links    "setup.py"        'dependency_links\s*=|--extra-index-url|--index-url' \
        'Custom package index / dependency_links - can pull attacker-controlled packages'
-  rule LOW  build-ext    "setup.py"        'build_ext|Extension\(|ext_modules' \
-       'Builds a native extension at install time'
+  # node-gyp runs binding.gyp during `npm install`. After preinstall/postinstall
+  # hooks became the thing everyone watches, weaponised binding.gyp became the
+  # way to get the same install-time execution without a lifecycle script.
+  rule MED  gyp-exec     "binding.gyp *.gyp *.gypi" '<!@?\(|"action"\s*:\s*\[' \
+       'binding.gyp shells out at build time - node-gyp runs it during "npm install", with no lifecycle script to notice'
 
   # native-extension import shadowing (the core ChocoPoC trick; loaders here)
   rule HIGH native-load  "*.py *.pyx"      'ctypes\.(CDLL|WinDLL|cdll|windll)|cffi|LoadLibrary' \
@@ -209,30 +240,50 @@ load_rules() {
   # environmental gating / anti-analysis
   rule HIGH env-gating   "*.py *.pyx"      'EXPLOIT_POC|0xF4835C9C' \
        'Gates behaviour on a specific filename/constant - runs only in the intended target, not under review'
-  rule MED  self-inspect "*.py *.pyx"      'hash\([^)]*(__file__|basename)|__file__[^\n]{0,40}==[^\n]{0,20}0x|for\s+\w+\s+in\s+(list\()?sys\.modules' \
+  rule MED  self-inspect "*.py *.pyx"      'hash\([^)]*(__file__|basename)|__file__.{0,40}==.{0,20}0x|for\s+\w+\s+in\s+(list\()?sys\.modules' \
        'Hashes its own filename or inspects loaded modules - fingerprints its runtime to run only in a specific environment'
   rule MED  anti-debug   "*.py *.pyx *.c"  'CheckRemoteDebuggerPresent|IsDebuggerPresent|GetThreadContext|ptrace\(' \
        'Anti-debugging check (IsDebuggerPresent/ptrace) - detects or blocks a debugger'
-  rule MED  sandbox-check "*.py *.pyx"     'platform\.node|getpass\.getuser|hostname.*(sandbox|vmware|virtualbox)' \
-       'Environment fingerprinting - checks hostname/user, may refuse to run under analysis'
+  # Was: any platform.node()/getpass.getuser() call, which honest code does all
+  # the time. Only the comparison against known analysis environments is a
+  # malware behaviour.
+  rule MED  sandbox-check "$ANY"           '(hostname|platform\.node\(\)|getuser\(\)).{0,60}(sandbox|vmware|virtualbox|qemu|cuckoo|analyst|malware)|/sys/class/dmi.{0,40}(vendor|product)' \
+       'Compares the hostname/machine against sandbox and VM names - refuses to run where it would be watched'
+  # Malware now ships text aimed at the analyst's tooling rather than the
+  # analyst: macOS.Gaslight embedded dozens of fake system messages to talk an
+  # AI triage step into calling it clean. This scanner has an LLM pass, so this
+  # is both a detection and a defence of that pass.
+  rule HIGH llm-evasion  "$ANYPLUS *.md *.txt" \
+       '([Ii]gnore|[Dd]isregard|[Ff]orget)\s+(all\s+)?(your\s+|the\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)|[Aa]s\s+an?\s+AI.{0,60}(safe|benign|harmless|no\s+threat)|[Tt]h(is|e)\s+(file|package|code|script|program)\s+is\s+(completely\s+)?(safe|benign|harmless).{0,60}(do\s+not|don.t|no\s+need\s+to)\s+(flag|report|analyz|review)|<\|im_(start|end)\|>|\[/INST\]|^\s*###\s*(System|Assistant)\s*:' \
+       'Text addressed to an automated reviewer, telling it to ignore its instructions or declare the file safe - present only to defeat AI-assisted analysis'
 
   # obfuscation / dynamic execution
-  rule HIGH pack-exec    "*.py *.pyx"      '(marshal\.loads|zlib\.decompress|lzma\.decompress|codecs\.decode).*(exec|eval)|exec\(.*decompress|exec\(.*b64decode' \
+  rule HIGH pack-exec    "*.py *.pyx"      '(marshal\.loads|zlib\.decompress|lzma\.decompress|codecs\.decode).{0,80}(exec|eval)|exec\(.{0,80}decompress|exec\(.{0,80}b64decode' \
        'Decodes or decompresses data and then executes it'
-  rule MED  dyn-exec     "*.py *.pyx"      'exec\(|eval\(|__import__\(|compile\(.*exec' \
+  # Decoding, and dynamic execution, are each ordinary on their own - honest code
+  # base64s things and calls exec() constantly. Only the combination, and code
+  # pulled in at runtime, say anything about intent. The bare primitives stay as
+  # LOW: hidden from the default report so they cannot drive a verdict, still on
+  # record for someone reading with -v or --json.
+  rule LOW  dyn-exec     "*.py *.pyx"      'exec\(|eval\(|__import__\(|compile\(.{0,60}exec' \
        'Dynamic code execution (exec/eval/compile/__import__)'
-  rule MED  decode       "*.py *.pyx"      'base64\.b(64|85|32)decode|bytes\.fromhex|codecs\.decode.*rot' \
+  rule LOW  decode       "*.py *.pyx"      'base64\.b(64|85|32)decode|bytes\.fromhex|codecs\.decode.{0,40}rot' \
        'Decodes encoded data (base64/hex/rot13)'
-  rule LOW  blob         "*.py *.pyx *.txt" '[A-Za-z0-9+/]{220,}={0,2}' \
-       'Very long base64-like literal - could be embedded data'
+  rule HIGH py-fetch-exec "*.py *.pyx" \
+       '(exec|eval)\(\s*[^)]{0,80}(requests\.(get|post)|urlopen|httpx\.(get|post)|urlretrieve)\(' \
+       'Executes code downloaded at runtime - what runs is chosen by a server, after any review'
+  rule HIGH multi-decode "$ANY" \
+       'b64decode\(.{0,60}b64decode\(|atob\(.{0,60}atob\(|base64\s+(-d|-D|--decode).{0,60}\|.{0,40}base64\s+(-d|-D|--decode)' \
+       'Nested base64 layers - encoding applied repeatedly to get a payload past scanners'
+  rule MED  str-obf      "$ANY" \
+       '\[::-1\].{0,60}(http|urlopen|connect|requests|exec)|(https?|urlopen|exec).{0,30}\[::-1\]|String\.fromCharCode\([^)]{60,}|"?"\.join\(chr\(.{0,60}(\^|-|\+)\s*\w' \
+       'Builds a string by reversal or character arithmetic - hides a URL or command from anyone searching the file'
   rule MED  hex-blob     "*.py *.pyx"      '(\\x[0-9a-fA-F]{2}){40,}' \
        'Long \\xNN byte string - possible shellcode/obfuscated data'
 
   # shell / command execution
-  rule MED  shell-exec   "*.py *.pyx"      'os\.system\(|os\.popen\(|subprocess\.[A-Za-z_]+\([^)]*shell\s*=\s*True|pty\.spawn|commands\.getoutput' \
+  rule LOW  shell-exec   "*.py *.pyx"      'os\.system\(|os\.popen\(|subprocess\.[A-Za-z_]+\([^)]*shell\s*=\s*True|pty\.spawn|commands\.getoutput' \
        'Executes shell commands (os.system / subprocess shell=True / pty.spawn)'
-  rule LOW  net-exec     "*.py *.pyx"      'urllib.*urlopen|requests\.(get|post)|socket\.socket|http\.client' \
-       'Makes network connections (urllib / requests / raw socket)'
 
   # credential / data harvesting
   rule HIGH harvest      "*.py *.pyx"      'Login Data|cookies\.sqlite|key4\.db|logins\.json|os_crypt|Local State|Keychain|_distutils' \
@@ -251,7 +302,7 @@ load_rules() {
        'Screen capture - confirm captures are not exfiltrated'
 
   # persistence / tampering
-  rule HIGH persist-pth  "*.py *.pyx"      '_distutils_hack|add_shim|site-packages.*\.pth|\.pth.*__import__' \
+  rule HIGH persist-pth  "*.py *.pyx"      '_distutils_hack|add_shim|site-packages.{0,60}\.pth|\.pth.{0,60}__import__' \
        'Writes a .pth / _distutils_hack shim - auto-executes on every interpreter start'
   rule LOW  timestomp    "*.py *.pyx *.c"  'os\.utime\(|SetFileTime|st_mtime\s*=' \
        'Timestomps files - forensic evasion (weak signal on its own)'
@@ -259,42 +310,99 @@ load_rules() {
   # C2 evasion (DoH tunneling, SNI/host-header fronting, Mapbox abuse)
   rule HIGH doh          "*.py *.pyx"      'dns-query|application/dns-json|dns\.google/resolve|cloudflare-dns\.com|/resolve\?name=' \
        'DNS-over-HTTPS resolution - hides C2 lookup from network monitoring'
-  rule HIGH sni-front    "*.py *.pyx"      'assert_hostname|server_hostname|HostHeaderSSLAdapter|set_ciphers.*ServerName|TLS.*SNI' \
+  rule HIGH sni-front    "*.py *.pyx"      'assert_hostname|server_hostname|HostHeaderSSLAdapter|set_ciphers.{0,60}ServerName|TLS.{0,40}SNI' \
        'SNI / Host-header fronting - disguises C2 traffic as a trusted service'
-  rule MED  mapbox-c2    "*.py *.pyx"      'api\.mapbox\.com|mapbox.*(dataset|feature)' \
+  rule MED  mapbox-c2    "*.py *.pyx"      'api\.mapbox\.com|mapbox.{0,60}(dataset|feature)' \
        'Uses Mapbox datasets/features - abused for C2 tasking in ChocoPoC'
 
   # general malicious code (polyglot)
   rule HIGH reverse-shell "$ANYPLUS" \
-       '/dev/tcp/|nc\s+-e|ncat\s+-e|mkfifo.*(/bin/sh|nc )|bash\s+-i\s*>&|pty\.spawn\(.{0,12}/bin/(sh|bash)|socket.*(dup2|SOCK_STREAM).*(/bin/sh|exec)' \
+       '/dev/tcp/|nc\s+-e|ncat\s+-e|mkfifo.{0,60}(/bin/sh|nc )|bash\s+-i\s*>&|pty\.spawn\(.{0,12}/bin/(sh|bash)|socket.{0,80}(dup2|SOCK_STREAM).{0,80}(/bin/sh|exec)' \
        'Reverse-shell pattern - hands an interactive shell to a remote host'
   rule HIGH download-exec "$ANYPLUS Makefile *.dockerfile" \
-       '(curl|wget)\s+[^|;]*\|\s*(sudo\s+)?((ba)?sh|node|python[0-9.]*|perl|ruby)|(curl|wget)[^;|]*;[^;]*chmod\s+\+x|urlretrieve\(|certutil\s+-urlcache|bitsadmin\s+/transfer|Invoke-WebRequest[^\n]*\|\s*iex' \
+       '(curl|wget)\s+[^|;]*\|\s*(sudo\s+)?((ba)?sh|node|python[0-9.]*|perl|ruby)|(curl|wget)[^;|]*;[^;]*chmod\s+\+x|urlretrieve\(|certutil\s+-urlcache|bitsadmin\s+/transfer|Invoke-WebRequest.*\|\s*iex' \
        'Downloads a remote file and executes it'
   rule HIGH destructive  "$ANYPLUS Makefile" \
        'rm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+["]?(--no-preserve-root|/(\s|$|\*|["])|~(\s|/|$)|\$\{?HOME|\*(\s|$))|\bmkfs\.|dd\s+if=/dev/(zero|u?random)\s+of=/dev|:\(\)\s*\{\s*:\s*\|\s*:&?|shutil\.rmtree\(\s*["]?(/(["]|\s*\))|~|\$HOME)' \
        'Destructive filesystem/disk wipe or fork bomb'
   rule HIGH win-lolbin   "*.ps1 *.psm1 *.bat *.cmd *.hta *.vbs" \
-       'powershell.*-e(nc(odedcommand)?)?\b|-EncodedCommand|IEX\s*\(|Invoke-Expression|New-Object\s+Net\.WebClient|FromBase64String|\bmshta\b|regsvr32.*scrobj|DownloadString' \
+       'powershell.{0,40}-e(nc(odedcommand)?)?\b|-EncodedCommand|IEX\s*\(|Invoke-Expression|New-Object\s+Net\.WebClient|FromBase64String|\bmshta\b|regsvr32.{0,40}scrobj|DownloadString' \
        'Encoded PowerShell / living-off-the-land binary execution'
   rule HIGH miner        "$ANY *.yml *.yaml *.json *.conf" \
-       'stratum\+tcp://|\bxmrig\b|\bminerd\b|cpuminer|coinhive|supportxmr|nicehash|nanopool' \
+       'stratum\+tcp://|\bxmrig\b|cpuminer|coinhive|supportxmr|nicehash|nanopool' \
        'Cryptocurrency miner reference'
   rule HIGH backdoor-acct "$ANY Makefile" \
-       'useradd\b[^\n]{0,60}(-o\s+-u\s*0|-G\s+(sudo|wheel))|net\s+user\b[^\n]{0,40}/add|net\s+localgroup\b[^\n]{0,40}/add' \
+       'useradd\b.{0,60}(-o\s+-u\s*0|-G\s+(sudo|wheel))|net\s+user\b.{0,40}/add|net\s+localgroup\b.{0,40}/add' \
        'Creates a new user account with uid 0 or sudo/wheel/admin group'
   rule MED  exfil-channel "$ANYPLUS" \
        'discord(app)?\.com/api/webhooks|hooks\.slack\.com/services|pastebin\.com/(api|raw)|api\.telegram\.org/bot|https?://t\.me/|transfer\.sh|0x0\.st|termbin\.com' \
        'Exfiltration channel (webhook / paste / telegram / anonymous upload)'
   rule MED  persistence  "$ANY" \
-       'crontab\s+-|/etc/cron|authorized_keys|~/\.(bashrc|zshrc|profile)|LaunchAgents|LaunchDaemons|/etc/systemd/system|reg\s+add.*\\Run|schtasks\s+/create|New-Service' \
+       'crontab\s+-|/etc/cron|authorized_keys|~/\.(bashrc|zshrc|profile)|LaunchAgents|LaunchDaemons|/etc/systemd/system|\.config/systemd/user|\.config/autostart|/etc/ld\.so\.preload|reg\s+add.{0,60}\\Run|schtasks\s+/create|New-Service' \
        'Installs a persistence mechanism (cron / autostart / service / SSH key)'
   rule MED  secret-scrape "$ANY" \
-       '/proc/self/environ|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|GITHUB_TOKEN|\.aws/credentials|\.docker/config\.json|\.kube/config' \
+       '/proc/self/environ|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|GITHUB_TOKEN|NPM_TOKEN|VAULT_TOKEN|\.aws/credentials|\.docker/config\.json|\.kube/config|\.git-credentials|\.config/gh/hosts\.yml|_authToken' \
        'Reads cloud keys / access tokens / credential files'
+  # The current stealer target list: the developer's own publishing tokens, and
+  # the config files of local AI coding tools, which now hold API keys.
+  rule HIGH devtool-theft "$ANY" \
+       '\.claude(\.json|/\.credentials)|\.codeium/|\.cursor/.{0,30}(config|state|mcp)|\.continue/config|Bitwarden.{0,20}(data\.json|vault)|1[Pp]assword.{0,20}(sqlite|vault)|\.mozilla.{0,30}logins\.json|\.config/solana/id\.json' \
+       'Reads local AI-tool, password-manager or wallet credential stores - the 2026 infostealer target set'
+  # Disposable tunnel endpoints: how malware gets a reachable C2 address without
+  # registering a domain that could be blocked or attributed.
+  rule MED  tunnel-c2    "$ANYPLUS" \
+       '[a-z0-9-]{4,}\.ngrok(-free)?\.(io|app|dev)|[a-z0-9-]{4,}\.trycloudflare\.com|\.loca\.lt\b|[a-z0-9-]{4,}\.serveo\.net|\.localtunnel\.me|\.pagekite\.me|\.telebit\.io' \
+       'Talks to a disposable tunnel endpoint (ngrok / trycloudflare / localtunnel) - a C2 address that needs no domain registration'
+  # Shai-Hulud-class worms exfiltrate into repositories they create under the
+  # victim's own account, and persist by committing a workflow.
+  rule HIGH repo-exfil   "$ANY" \
+       'api\.github\.com/user/repos|/actions/secrets/|\.github/workflows/.{0,60}(writeFile|open\(|fs\.write)|(execSync|exec|spawn(Sync)?)\(.{0,40}npm\s+publish|npm\s+publish.{0,60}(NODE_AUTH_TOKEN|NPM_TOKEN|_authToken)' \
+       'Creates a remote repo, reads Actions secrets, writes a CI workflow or republishes a package from inside the code - the npm worm exfiltration and self-propagation path'
   rule MED  shell-obf    "$SH" \
-       'eval\s+"?\$\(|base64\s+-d\s*\|\s*(ba)?sh|\$\{IFS\}|`.*\$\(.*`|xxd\s+-r\s+-p' \
+       'eval\s+"?\$\(|base64\s+-d\s*\|\s*(ba)?sh|\$\{IFS\}|`.{0,60}\$\(.{0,60}`|xxd\s+-r\s+-p' \
        'Obfuscated or dynamically-evaluated shell'
+  # macOS stealers are overwhelmingly fileless: fetch, decompress and hand
+  # straight to an interpreter, so nothing lands on disk to be hashed or
+  # quarantined.
+  rule HIGH macos-inmem  "$ANYPLUS" \
+       '(curl|wget)[^|]{0,160}\|\s*(sudo\s+)?osascript|(curl|wget)[^|]{0,160}\|\s*(gunzip|zcat|funzip|base64\s+(-d|-D|--decode)).{0,60}\|\s*(ba|z)?sh' \
+       'Pipes downloaded content straight into osascript or through a decompressor into a shell - runs in memory, nothing written to disk'
+  rule HIGH gatekeeper   "$ANYPLUS" \
+       'xattr\s+.{0,30}-d\s+com\.apple\.quarantine|xattr\s+-c[r]?\s|spctl\s+--(master|global)-disable|csrutil\s+disable|SetFile\s+-a\s+V' \
+       'Strips macOS quarantine or disables Gatekeeper/SIP - removes the check that would have warned you before this code ran'
+
+  # ===== JavaScript / Node, i.e. what is inside an Electron .asar =============
+  # The execution primitives above are mostly Python-shaped. Unpacking an asar
+  # and then having no rule that reads JavaScript would be pointless, so these
+  # mirror dyn-exec / shell-exec / pack-exec for Node.
+  # Deliberately NOT "uses eval" or "requires child_process". Every bundled app
+  # trips those: webpack emits a stub table naming every Node builtin, and bare
+  # eval( matches comments and regex literals in stock dependencies. Neither
+  # tells a reader anything about what the program will do to them. What matters
+  # is where the executed code comes from, and whether a command is built from
+  # data at runtime.
+  rule HIGH js-fetch-exec "$JS" \
+       '(eval|new\s+Function)\(\s*[^)]{0,80}(await\s+)?(fetch|axios|https?\.get|request)\(' \
+       'Executes code fetched over the network - what runs is decided by a server, after any review'
+  rule MED  js-shell-exec "$JS" \
+       '\b(exec|execSync)\(\s*[`"'"'"'][^`"'"'"'\n]{0,80}\$\{|\b(exec|execSync)\(\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*\+|\bspawn(Sync)?\(\s*["'"'"'`](sh|bash|zsh|cmd(\.exe)?|powershell(\.exe)?|osascript)["'"'"'`]' \
+       'Builds an OS command string at runtime or spawns a shell - what actually runs depends on data, not on this file'
+  rule HIGH js-decode-exec "$JS" \
+       '(eval|new\s+Function|execSync)\(.{0,100}Buffer\.from\(.{0,60}["'"'"'`](base64|hex)|Buffer\.from\(.{0,60}["'"'"'`](base64|hex)["'"'"'`]\).{0,80}\.(toString\(\)\s*\))?.{0,20}(eval|new\s+Function)\(' \
+       'Decodes a base64/hex blob and executes it - the code that actually runs is not in the file'
+
+  # Not "this workflow is injectable" - that is the author's vulnerability, and
+  # not something the person cloning the repo can act on. This is a workflow that
+  # takes the repository's secrets and sends them somewhere, which is credential
+  # theft that runs on every build. toJSON(secrets) dumps all of them at once.
+  rule HIGH ci-secret-exfil "*.yml *.yaml" \
+       'toJSON\(\s*secrets\s*\)|\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}.{0,100}(curl|wget|nc |https?://)|(curl|wget).{0,140}\$\{\{\s*secrets\.' \
+       'CI workflow sends repository secrets to a network destination - credential theft on every build'
+
+  # Deliberately no rule for webSecurity:false / nodeIntegration:true. Those are
+  # weak configuration, not malicious behaviour - honest apps ship them by the
+  # thousand, and a scanner that reports them is describing a vulnerability
+  # nobody asked it about while burying the findings that mean something.
 
   # ===== dev/researcher-workstation targeting (editor, IDE, CI autorun) ========
   # These fire when merely OPENING/cloning a repo runs code - the vector behind
@@ -307,21 +415,9 @@ load_rules() {
   rule HIGH shellcode    "*.py *.pyx *.c *.cs *.go *.js" \
        'VirtualAllocEx?|VirtualProtect|WriteProcessMemory|CreateRemoteThread|NtUnmapViewOfSection|mmap\([^)]*PROT_EXEC|PROT_EXEC[^)]*PROT_WRITE|ctypes\.cast\([^)]*CFUNCTYPE' \
        'Allocates executable memory or writes into another process (VirtualAlloc/mmap PROT_EXEC/WriteProcessMemory)'
-  rule LOW  pickle-exec  "*.py *.pyx" \
-       'pickle\.loads|cPickle\.loads|jsonpickle\.decode' \
-       'Unpickling untrusted data can execute code - verify the source is trusted'
-  rule MED  pickle-reduce "*.py *.pyx" \
-       'def __reduce__\s*\(' \
-       'Custom __reduce__ - controls what runs when the object is unpickled (a pickle RCE primitive)'
   rule MED  lib-inject   "$ANY" \
        'LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH' \
        'Library injection via LD_PRELOAD / DYLD_INSERT_LIBRARIES'
-  rule MED  ci-exec      "*.yml *.yaml" \
-       '\$\{\{\s*github\.event\.[^}]*(\.body|\.title|\.message|head_ref|head\.ref)|(curl|wget)\s+[^|]*\|\s*(ba)?sh' \
-       'CI workflow interpolates an injectable untrusted field (issue/PR body/title, head ref) into a step, or pipes a download into a shell'
-  rule MED  pkg-registry ".npmrc pip.conf .pypirc" \
-       '_authToken\s*=|//[^/]+/:_auth|_password\s*=|extra-index-url\s*=\s*https?' \
-       'Embedded registry token or extra package index - credential exposure / dependency-confusion vector'
 }
 
 run_content_rules() {
@@ -351,10 +447,159 @@ detect_native_shadowing() {
       add_finding CRIT import-shadow "$so" 0 \
         "Compiled '$base' shadows '$stem.py' in the same package - the binary imports instead of the source you can read"
     else
-      add_finding HIGH native-vendored "$so" 0 \
+      # Not a shadowing pair, just a compiled blob. This is an unreviewability
+      # note, not evidence of malice: every prebuilt app bundle, wheel and
+      # node-gyp module ships these. MED so it warns and reads, rather than
+      # blocking anything with a dylib in it. import-shadow above is the signal
+      # that actually indicts a binary.
+      add_finding MED native-vendored "$so" 0 \
         "Vendored compiled extension '$base' - binary, not reviewable as source; verify it by hash"
     fi
-  done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' \) 2>/dev/null || true)
+  done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' \) 2>/dev/null || true)
+}
+
+# --- Electron .asar archives -------------------------------------------------
+# An Electron app keeps its actual program in Contents/Resources/app.asar - a
+# concatenated blob behind a JSON header. A plain tree walk cannot see into it,
+# so scanning an .app bundle without unpacking reviews the GPU libraries and
+# misses the code. Unpack into the workdir; the engine then runs over the result.
+#
+# The archive is untrusted input, so the reader is deliberately narrow: entry
+# names with a separator or a ".." component are dropped rather than sanitised,
+# "link" entries are never materialised, and both the file count and the total
+# extracted size are capped.
+ASAR_MAX_BYTES="${SANITYCHECK_ASAR_MAX_BYTES:-67108864}"   # 64 MiB per archive
+ASAR_MAX_FILES="${SANITYCHECK_ASAR_MAX_FILES:-4000}"
+
+read -r -d '' ASAR_PY <<'PY' || true
+import json, os, struct, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+max_bytes, max_files = int(sys.argv[3]), int(sys.argv[4])
+
+with open(src, 'rb') as fh:
+    head = fh.read(16)
+    if len(head) < 16:
+        sys.exit(1)
+    # Chromium Pickle framing: [4][header_size][payload_size][json_len][json...]
+    # and the file data begins at 8 + header_size.
+    _, header_size, _, json_len = struct.unpack('<4I', head)
+    if not (0 < json_len <= header_size <= 1 << 28):
+        sys.exit(1)
+    try:
+        tree = json.loads(fh.read(json_len).decode('utf-8', 'replace'))
+    except ValueError:
+        sys.exit(1)
+    base = 8 + header_size
+    count = total = 0
+
+    def walk(node, parts):
+        global count, total
+        for name, ent in (node.get('files') or {}).items():
+            if name in ('', '.', '..') or '/' in name or '\\' in name or '\0' in name:
+                continue
+            sub = parts + [name]
+            if 'files' in ent:
+                walk(ent, sub)
+                continue
+            if 'link' in ent:        # symlink entry - never materialise it
+                continue
+            if ent.get('unpacked'):  # content sits in <archive>.unpacked/, already on disk
+                continue
+            try:
+                off, size = int(ent['offset']), int(ent['size'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if off < 0 or size < 0 or count >= max_files or total + size > max_bytes:
+                continue
+            fh.seek(base + off)
+            data = fh.read(size)
+            if len(data) != size:
+                continue
+            out = os.path.join(dest, *sub)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, 'wb') as w:
+                w.write(data)
+            count += 1
+            total += size
+
+    walk(tree, [])
+print(count)
+PY
+
+extract_asars() {
+  local a n dest i=0
+  while IFS= read -r a; do
+    [[ -z "$a" ]] && continue
+    if ! have python3; then
+      add_finding MED asar-unread "$a" 0 \
+        'Electron .asar archive found, but python3 is not available to unpack it - the application code inside was NOT scanned'
+      continue
+    fi
+    [[ -n "$WORK_DIR" ]] || make_workdir
+    i=$((i+1)); dest="$WORK_DIR/asar/$i"
+    mkdir -p "$dest"
+    n="$(python3 -c "$ASAR_PY" "$a" "$dest" "$ASAR_MAX_BYTES" "$ASAR_MAX_FILES" 2>/dev/null || true)"
+    if [[ -z "$n" || "$n" == "0" ]]; then
+      add_finding MED asar-unread "$a" 0 \
+        'Electron .asar archive could not be unpacked (corrupt or unsupported) - the application code inside was NOT scanned'
+      rm -rf "$dest"; continue
+    fi
+    ASAR_DIR+=("$dest"); ASAR_LABEL+=("$(rel "$a")")
+    info "asar: unpacked $n files from $(rel "$a")"
+  done < <(find "$ROOT" -type f -name '*.asar' 2>/dev/null | head -n 8 || true)
+}
+
+# Run the engine over each unpacked archive. node_modules is excluded from the
+# normal tree walk because in a source repo those are third-party files you have
+# not installed yet - but inside an asar the bundled dependencies ARE the shipped
+# program, and are where a trojanised build hides. So the exclusion is lifted.
+#
+# detect_npm_scripts / detect_registry_redirect / detect_autorun_files are
+# deliberately NOT run here. They all answer "what happens when you install
+# this", and nobody installs an asar - it is the built output. Running them
+# anyway is what made a stock Amazon Chime build score DANGEROUS off its own
+# bundled lifecycle scripts.
+audit_asar_payloads() {
+  (( ${#ASAR_DIR[@]} )) || return 0
+  local outer_root="$ROOT" outer_ex=("${GREP_EXCLUDES[@]}") d
+  GREP_EXCLUDES=(--exclude-dir=.git)
+  ASAR_PASS=1
+  for d in "${ASAR_DIR[@]}"; do
+    ROOT="$d"
+    run_content_rules
+    detect_native_shadowing
+    detect_iocs
+  done
+  ASAR_PASS=0
+  ROOT="$outer_root"; GREP_EXCLUDES=("${outer_ex[@]}")
+}
+
+# A committed registry token is the author leaking their own credential - not a
+# threat to you. A committed registry *redirect* is: the next `npm install` or
+# `pip install` you run in this directory fetches its packages from that host
+# instead of the official index, which is the whole dependency-confusion play.
+# So this checks where installs are pointed, and official hosts are skipped -
+# it fires on redirection, not on the presence of a config file.
+detect_registry_redirect() {
+  local f hit ln text url host
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r hit; do
+      [[ -z "$hit" ]] && continue
+      ln="${hit%%:*}"; text="${hit#*:}"
+      url="$(printf '%s' "$text" | grep -oE 'https?://[^[:space:]"'"'"']+' | head -1)"
+      [[ -n "$url" ]] || continue
+      host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+      case "$host" in
+        registry.npmjs.org|registry.yarnpkg.com|npm.pkg.github.com|\
+        pypi.org|files.pythonhosted.org|pypi.python.org|test.pypi.org) continue ;;
+      esac
+      add_finding MED registry-redirect "$f" "$ln" \
+        "Package installs are redirected to '$host' - an install run in this directory fetches code from there rather than the official index"
+    done < <(grep -nE '^[^#]*(registry|index-url|extra-index-url)[[:space:]]*=' "$f" 2>/dev/null | head -n 5 || true)
+  done < <(find "$ROOT" -maxdepth 4 -type f \( -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' \
+             -o -name 'pip.conf' -o -name '.pypirc' -o -name 'poetry.toml' \) 2>/dev/null | head -n 20 || true)
 }
 
 detect_pth_files() {
@@ -452,6 +697,24 @@ sha256_file() {
   else return 1; fi
 }
 
+# What a flagged file contributes to the LLM prompt. A compiled binary cannot be
+# pasted in as-is: command substitution strips its null bytes (noisily) and the
+# model gets byte soup regardless. Send an identity the user can act on - type,
+# size, sha256 - plus the printable strings, which is what a reviewer would
+# actually look at.
+llm_excerpt() { # file -> prompt text
+  local f="$1"
+  if grep -qI . "$f" 2>/dev/null; then
+    head -c 8000 "$f" 2>/dev/null || true
+    return 0
+  fi
+  printf '(binary: %s, %s bytes, sha256 %s)\nprintable strings:\n%s\n' \
+    "$(file -b "$f" 2>/dev/null || echo unknown)" \
+    "$(wc -c <"$f" 2>/dev/null | tr -d ' ')" \
+    "$(sha256_file "$f" 2>/dev/null || echo unavailable)" \
+    "$(strings -n 6 "$f" 2>/dev/null | head -n 150 | tr -d '\0' || true)"
+}
+
 IOC_PKG=(); IOC_SHA=(); IOC_ENV=(); IOC_STR=(); IOC_HOST=()
 IOC_PKG_NOTE=(); IOC_SHA_NOTE=(); IOC_PKG_NORM=()
 load_iocs() {
@@ -479,6 +742,25 @@ load_iocs() {
 # separators, so a known-bad "skytext" also catches "sky-text" / "sky_text".
 norm_pkg() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '._-'; }
 
+# Files the IOC string pass will read. That pass uses grep -a, deliberately: a
+# C2 host or env marker embedded in a compiled payload is exactly what we want to
+# catch. But with no size bound it also reads every byte of the stock frameworks
+# in an application bundle, which was the single largest cost in a scan - about
+# three of the four minutes a 450 MB .app used to take. Files over the cap are
+# still hash-checked against the IOC database, which is the right tool for a
+# large binary anyway.
+IOC_SCAN_MAX_BYTES="${SANITYCHECK_IOC_SCAN_MAX_BYTES:-4194304}"
+ioc_scan_files() {
+  local prune=(-name .git)
+  # inside an asar the bundled deps are the shipped program, so they stay in
+  if [[ "$ASAR_PASS" != "1" ]]; then
+    prune+=(-o -name node_modules -o -name .venv -o -name venv -o -name __pycache__
+            -o -name .tox -o -name .mypy_cache -o -name .pytest_cache)
+  fi
+  find "$ROOT" -type d \( "${prune[@]}" \) -prune -o \
+       -type f -size -"${IOC_SCAN_MAX_BYTES}"c -print0 2>/dev/null || true
+}
+
 detect_iocs() {
   local d k
   for d in "${DECLARED_PKGS[@]:-}"; do
@@ -505,7 +787,7 @@ detect_iocs() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"; local match="${rest#*:}"
       add_finding CRIT ioc-str "$file" "$line" "Contains known IOC marker '$match' (from the IOC database)"
-    done < <(grep -rInaoE "${GREP_EXCLUDES[@]}" -- "$joined" "$ROOT" 2>/dev/null | head -n 20 || true)
+    done < <(ioc_scan_files | xargs -0 grep -HInaoE -- "$joined" 2>/dev/null | head -n 20 || true)
   fi
   if [[ ${#IOC_SHA[@]} -gt 0 ]]; then
     local art
@@ -520,7 +802,7 @@ detect_iocs() {
         fi
         i=$((i+1))
       done
-    done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) 2>/dev/null || true)
+    done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.asar' \) 2>/dev/null || true)
   fi
 }
 
@@ -551,9 +833,33 @@ more_severe() { # a b -> the more severe verdict
   [[ "$(sev_rank "$1")" -ge "$(sev_rank "$2")" ]] && printf '%s' "$1" || printf '%s' "$2"
 }
 
+# Counts that decide the verdict, as opposed to N_* which report what was found.
+# Every finding is still listed, but one signal repeated across many files is
+# still one signal: a tag counts at most twice toward the verdict at a given
+# severity. Without this a bundle shipping six copies of the same unreviewable
+# dylib escalates itself on volume alone, while two genuinely independent HIGH
+# findings still escalate as before.
+verdict_counts() { # -> "crit high med"
+  local i sev tag key c=0 h=0 m=0 seen="$SEP"
+  for ((i=0; i<${#F_SEV[@]}; i++)); do
+    sev="${F_SEV[$i]}"; tag="${F_TAG[$i]}"
+    case "$sev" in CRIT|HIGH|MED) ;; *) continue ;; esac
+    key="$sev$SEP$tag"
+    case "$seen" in
+      *"$SEP${key}#2$SEP"*) continue ;;
+      *"$SEP${key}#1$SEP"*) seen="$seen${key}#2$SEP" ;;
+      *)                    seen="$seen${key}#1$SEP" ;;
+    esac
+    case "$sev" in CRIT) c=$((c+1)) ;; HIGH) h=$((h+1)) ;; MED) m=$((m+1)) ;; esac
+  done
+  printf '%s %s %s' "$c" "$h" "$m"
+}
+
 static_verdict() {
-  if (( N_CRIT >= 1 || N_HIGH >= 2 )); then echo DANGEROUS
-  elif (( N_HIGH == 1 || N_MED >= 1 )); then echo CAUTION
+  local c h m
+  read -r c h m <<<"$(verdict_counts)"
+  if (( c >= 1 || h >= 2 )); then echo DANGEROUS
+  elif (( h == 1 || m >= 1 )); then echo CAUTION
   else echo SAFE; fi
 }
 
@@ -670,7 +976,7 @@ run_llm() {
       case " ${seen[*]:-} " in *" $f "*) continue ;; esac
       seen+=("$f")
       (( ${#payload} > budget )) && break
-      payload+=$'\n\n----- '"$(rel "$f")"$' -----\n'"$(head -c 8000 "$f" 2>/dev/null || true)"
+      payload+=$'\n\n----- '"$(rel "$f")"$' -----\n'"$(llm_excerpt "$f")"
     done
     [[ ${#seen[@]} -eq 0 ]] && { info "llm: nothing flagged to review"; return 0; }
   fi
@@ -999,13 +1305,18 @@ audit_repo_or_file() {
   [[ -n "$ROOT" ]] || die "could not acquire target: $TARGET"
   load_rules; load_iocs
   collect_python_deps
+  extract_asars
   run_content_rules
   detect_native_shadowing
   detect_pth_files
   detect_npm_scripts
+  detect_registry_redirect
   detect_autorun_files
   detect_iocs
   run_deep_pass
+  # after the deep pass: it is a Python AST/typosquat pass, and asar payloads are
+  # JavaScript, so it has nothing to say about them and they can be large.
+  audit_asar_payloads
 }
 
 # --- run-after (installer only) ----------------------------------------------

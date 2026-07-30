@@ -1,5 +1,11 @@
-# INERT FIXTURE - a single dynamic-eval, nothing else. Should scan as CAUTION:
-# one MED finding, not enough for DANGEROUS. Used to test --strict exit codes.
+# INERT FIXTURE - one MED finding and nothing else, so it scans as CAUTION
+# rather than DANGEROUS. Used to test the CAUTION verdict and --strict exit code.
+# Reading cloud credentials is worth a look but is not on its own proof of
+# anything, which is exactly what MED means.
 raise SystemExit("inert fixture")
-def handle(expr):
-    return eval(expr)   # dyn-exec -> MED -> CAUTION
+import os
+
+def load_profile():
+    path = os.path.expanduser("~/.aws/credentials")   # secret-scrape -> MED -> CAUTION
+    with open(path) as fh:
+        return fh.read()

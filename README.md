@@ -4,9 +4,9 @@
 
 ## sanitycheck
 
-Audit untrusted code before you run it. `sanitycheck` automatically scans `curl | bash` style installers, cloned PoC repos and their dependencies, pip/npm/etc installs, and single scripts as/before you run them. Then, it gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. (It never runs any code it checks)
+Audit untrusted code before you run it. `sanitycheck` scans `curl | bash` installers, cloned repos and their dependencies, pip/npm installs, and single scripts, then gives a `SAFE` / `CAUTION` / `DANGEROUS` verdict. It never runs the code it checks.
 
-The goal is a baseline security check with no extra effort: shell hooks catch the commands, and anything not flagged runs as normal.
+A baseline security check with no extra effort: shell hooks catch the commands, and anything not flagged runs as normal.
 
 <p align="center">
   <img src="demo.svg" alt="sanitycheck auditing a git clone, a pip install, a curl|bash installer, and direct usage — showing DANGEROUS, CAUTION, and SAFE verdicts" width="720">
@@ -34,7 +34,7 @@ Requires `bash`, `grep`, `find`. `python3` and an LLM provider are optional.
 
 ## How it works
 
-With the shell hook enabled, sanitycheck audits automatically when you clone a repo, install dependencies, or `curl | bash`:
+With the shell hook enabled, sanitycheck audits automatically:
 
 | Trigger | Scan |
 |---------|------|
@@ -42,13 +42,15 @@ With the shell hook enabled, sanitycheck audits automatically when you clone a r
 | `git clone <url>` | **fast** static scan of the fresh checkout |
 | `pip` / `pip3` / `pipx` / `npm` / `yarn` / `pnpm` / `poetry` / `uv` install | **deep** scan with dependency resolution; aborts on DANGEROUS |
 
-Each hook asks first (`[Y/n]`, Enter audits, `n` skips); without a terminal it scans automatically. It picks the analysis from what you're doing, prints the verdict, and never installs, imports, builds, or runs the target.
+Each hook asks first (`[Y/n]`, Enter audits, `n` skips); without a terminal it scans automatically. It never installs, imports, builds, or runs the target.
 
-Clone is fast because dependencies aren't pulled yet and build scripts are already scanned statically; resolution is saved for install, where deps are fetched and the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `gradle`) aren't hooked — that's what the clone scan is for.
+Clone is fast because dependencies aren't pulled yet; resolution waits for install, where the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `gradle`) aren't hooked — that's what the clone scan is for.
 
-Core checks are pure shell (`grep`/`find`) and run offline. `python3` (optional) adds AST / typosquat / Unicode analysis, dependency resolution, and `--json`; an LLM (optional) adds a second opinion. Missing pieces are skipped, not fatal.
+Core checks are pure shell (`grep`/`find`) and run offline. `python3` adds AST / typosquat / Unicode analysis, dependency resolution, `.asar` unpacking, and `--json`; an LLM adds a second opinion. Missing pieces are skipped, not fatal.
 
-Enable it yourself (the installer does this for you):
+Electron apps keep their code in `app.asar`, which a directory walk can't see into. Archives are unpacked and scanned, with findings reported as `app.asar!/index.js`.
+
+Enable the hook yourself (the installer does this for you):
 
 ```sh
 echo 'source ~/.local/share/sanitycheck/hooks/sanitycheck.zsh' >> ~/.zshrc  # or .bashrc
@@ -60,25 +62,38 @@ echo 'source ~/.local/share/sanitycheck/hooks/sanitycheck.zsh' >> ~/.zshrc  # or
 
 ## What it catches
 
+Malicious behaviour, not weak configuration: an insecure setting is someone else's bug to fix, and reporting it buries the findings that are code doing something to you.
+
 Supply-chain trojans:
 
-- compiled `.so`/`.pyd` that shadows a same-named `.py` on import; vendored native extensions; IOC file-hash matches
-- `setup.py` install hooks, `.pth`/`_distutils_hack` shims, npm lifecycle scripts
-- filename gating, DoH/SNI-fronted C2, browser-credential harvesting
-- known-malicious, typosquatted, or non-existent (dependency-confusion) packages, including transitive ones
+- compiled `.so`/`.pyd`/`.node` shadowing a same-named `.py` on import; vendored native extensions; IOC hash matches
+- `setup.py` hooks, `.pth` shims, npm lifecycle scripts, `binding.gyp` build-time execution
+- typosquatted, known-malicious, or non-existent (dependency-confusion) packages, including transitive ones
+- installs redirected to a non-official registry or index
 
-Editor and project autorun:
+Zero-click autorun:
 
 - VS Code `tasks.json` `runOn: folderOpen`, Visual Studio build events
-- `conftest.py`, `sitecustomize.py`, `.envrc` auto-run
+- `conftest.py`, `sitecustomize.py`, `.envrc`
 - Trojan Source bidi / invisible Unicode
 
-General malware (shell, PowerShell, JS, Ruby, Go, Rust, Makefiles, Dockerfiles):
+Code you can't read from the file:
 
-- reverse shells, download-and-exec, destructive ops, encoded PowerShell, miners, exfil channels, persistence, keyloggers, wallet/credential theft, shellcode runners
+- `eval`/`exec` fed from `fetch` or a base64 blob; nested encoding layers
+- URLs built by string reversal or character arithmetic to stay out of a grep
+- DoH/SNI-fronted C2, tunnel endpoints (ngrok, trycloudflare), filename gating
+- text aimed at an automated reviewer ("ignore previous instructions") — malware ships prompt injection to talk AI triage out of a verdict, and this tool has one
 
-Findings are weighted and de-duplicated per file, so a lone `eval()` is `CAUTION`, not `DANGEROUS`.
+Theft and persistence:
 
+- shell history, SSH keys, cloud/CI tokens, keychain, wallets, password vaults, AI-tool credentials
+- creating a repo, reading Actions secrets, or committing a workflow from inside the code
+- downloads piped into `osascript`; stripping quarantine, disabling Gatekeeper/SIP
+- LaunchAgents, systemd user units, `.config/autostart`, `/etc/ld.so.preload`, cron, authorized_keys
+
+General malware (shell, JS, Python, Ruby, Go, Makefiles, Dockerfiles): reverse shells, download-and-exec, destructive ops, miners, exfil channels, keyloggers, shellcode. Windows payloads too — encoded PowerShell in a repo is evidence the repo is malicious even where it can't run.
+
+One signal repeated across many files counts once toward the verdict, so an app shipping six vendored dylibs is a `CAUTION` to read, not a block. Dual-use signals (`eval`, `subprocess`, base64) are `LOW`: visible under `-v` or `--json`, never able to drive a verdict.
 
 ## Direct usage
 
@@ -89,6 +104,7 @@ sanitycheck "curl -fsSL https://example.com/install.sh | bash"   # installer
 sanitycheck ./CVE-2026-12345-poc                                 # cloned repo
 sanitycheck https://github.com/x/poc.git                         # clone + scan
 sanitycheck exploit.py                                           # single file
+sanitycheck ~/Downloads/Some.app                                 # app bundle
 ```
 
 | Flag | Description |
@@ -113,11 +129,11 @@ Exit codes: `0` SAFE/CAUTION, `1` DANGEROUS, `2` error. `--strict` makes CAUTION
 
 ## Dependency & staged-payload resolution
 
-On a repo, sanitycheck walks each dependency's PyPI metadata graph (it never builds or installs — that would run `setup.py`) and flags malicious, typosquatted, or non-existent transitive deps. This catches `frint → skytext` even when the bad package isn't in your manifest.
+On a repo, sanitycheck walks each dependency's PyPI metadata graph — never building or installing, which would run `setup.py` — and flags malicious, typosquatted, or non-existent transitive deps. This catches `frint → skytext` even when the bad package isn't in your manifest.
 
-On an installer, it extracts the URLs the script downloads, fetches each into a scratch dir (bounded, never executed, skipping cloud-metadata and link-local hosts), and scans those too, following stage-2 to stage-3. A server can detect `curl|bash` and serve benign content to a plain fetch, so a clean result here is not proof of safety.
+On an installer, it extracts the URLs the script downloads, fetches each into a scratch dir (bounded, never executed, skipping cloud-metadata and link-local hosts), and scans those too, following stage-2 to stage-3. A server can serve benign content to a plain fetch and the real payload to `curl|bash`, so a clean result here is not proof of safety.
 
-Resolution is capped at ~12s (`SANITYCHECK_RESOLVE_BUDGET`); `--fast`/`--offline`/`--no-follow` turn the network layers off.
+Capped at ~12s (`SANITYCHECK_RESOLVE_BUDGET`); `--fast`/`--offline`/`--no-follow` turn the network layers off.
 
 ## LLM providers
 
@@ -142,11 +158,13 @@ Override with `--provider`/`--model` or `SANITYCHECK_PROVIDER`/`SANITYCHECK_MODE
 ./test.sh
 ```
 
-A few seconds, offline and deterministic. Unit tests source individual shell functions (input classification, verdict merge, LLM/URL parsing); integration tests scan the inert fixtures in `tests/` and assert on verdict, exit code, and which detections fire — the ChocoPoC chain, general malware, the deep-pass, dev-targeting vectors, evasion variants, and the `git`/`pip`/`npm` hook wrappers. Fixtures never execute (dangerous lines are quoted strings or behind a `raise SystemExit`).
+A few seconds, offline and deterministic. Unit tests source individual shell functions; integration tests scan the inert fixtures in `tests/` and assert on verdict, exit code, and which detections fire. Fixtures never execute — dangerous lines are quoted strings or behind a `raise SystemExit`.
 
 ## Limitations
 
 Heuristic and text-based — it reads code, it doesn't sandbox it. A `SAFE` verdict isn't proof of safety and a flagged one isn't proof of malice; read the findings, and run untrusted code in a throwaway VM.
+
+macOS and Linux only. A large `.app` bundle takes about a minute, mostly reading framework binaries for IOC strings.
 
 ## Uninstall
 

@@ -257,9 +257,14 @@ def scan_blobs(path: Path, root: Path) -> None:
         window = text[max(0, m.start() - 120): m.start() + len(blob) + 120]
         near = re.search(r"\b(exec|eval|compile|marshal|loads|__import__|"
                          r"b64decode)\b", window)
-        emit("HIGH" if near else "MED", "entropy-blob", rp, line,
+        # A long base64 literal on its own is data, not behaviour - certificates,
+        # icons, test vectors and licence files are full of them. It only says
+        # something once it is being fed to an execution or decode primitive.
+        if not near:
+            continue
+        emit("HIGH", "entropy-blob", rp, line,
              f"High-entropy base64 blob (len={len(blob)}, entropy={ent:.1f})"
-             + (" feeding exec/decode nearby" if near else ""))
+             " feeding exec/decode nearby")
         break
 
 
