@@ -420,18 +420,62 @@ load_rules() {
        'Library injection via LD_PRELOAD / DYLD_INSERT_LIBRARIES'
 }
 
+# --- search backend ----------------------------------------------------------
+# ripgrep is used when it is installed, purely because it is much faster over the
+# large binaries in an application bundle. It is not required and no check
+# depends on it; SANITYCHECK_SEARCH=grep forces the fallback, and test.sh asserts
+# both engines produce identical findings on the fixtures.
+#
+# Two ripgrep defaults have to be turned off. It skips hidden files and obeys
+# .gitignore - and a dotfile is often the finding (.npmrc, .envrc, .pth), while a
+# repo that gitignores its payload is the oldest trick there is. --hidden and
+# --no-ignore restore grep's plain view of the tree.
+SEARCH_BIN="${SANITYCHECK_SEARCH:-}"
+if [[ -z "$SEARCH_BIN" ]]; then
+  if have rg; then SEARCH_BIN="rg"; else SEARCH_BIN="grep"; fi
+fi
+
+rg_excludes() { # GREP_EXCLUDES -> ripgrep's negated-glob form
+  local e; for e in "${GREP_EXCLUDES[@]}"; do printf '%s\n' "!${e#--exclude-dir=}/"; done
+}
+
+search_rules() { # ere glob... -> file:line:match
+  local ere="$1"; shift
+  local g args=()
+  if [[ "$SEARCH_BIN" == "rg" ]]; then
+    args=(--no-ignore --hidden --no-messages --with-filename --line-number)
+    while IFS= read -r g; do args+=(-g "$g"); done < <(rg_excludes)
+    for g in "$@"; do args+=(-g "$g"); done
+    rg "${args[@]}" -e "$ere" -- "$ROOT" 2>/dev/null || true
+  else
+    args=(-rInE "${GREP_EXCLUDES[@]}")
+    for g in "$@"; do args+=(--include="$g"); done
+    grep "${args[@]}" -- "$ere" "$ROOT" 2>/dev/null || true
+  fi
+}
+
+search_iocs() { # ere -> file:line:match  (binaries read as text, size-capped)
+  local ere="$1" g args=()
+  if [[ "$SEARCH_BIN" == "rg" ]]; then
+    args=(--no-ignore --hidden --no-messages --with-filename --line-number
+          --text --only-matching --max-filesize "$IOC_SCAN_MAX_BYTES")
+    while IFS= read -r g; do args+=(-g "$g"); done < <(rg_excludes)
+    rg "${args[@]}" -e "$ere" -- "$ROOT" 2>/dev/null || true
+  else
+    ioc_scan_files | xargs -0 grep -HInaoE -- "$ere" 2>/dev/null || true
+  fi
+}
+
 run_content_rules() {
   local i n=${#RULE_SEV[@]}
   for ((i=0; i<n; i++)); do
     local sev="${RULE_SEV[$i]}" tag="${RULE_TAG[$i]}" glob="${RULE_GLOB[$i]}" ere="${RULE_ERE[$i]}" msg="${RULE_MSG[$i]}"
-    local inc=() g gl
-    read -ra gl <<< "$glob"
-    for g in "${gl[@]}"; do inc+=(--include="$g"); done
+    local gl; read -ra gl <<< "$glob"
     while IFS= read -r hit; do
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
       add_finding "$sev" "$tag" "$file" "$line" "$msg"
-    done < <(grep -rInE "${GREP_EXCLUDES[@]}" "${inc[@]}" -- "$ere" "$ROOT" 2>/dev/null | head -n 40 || true)
+    done < <(search_rules "$ere" "${gl[@]}" | head -n 40 || true)
   done
 }
 
@@ -750,13 +794,15 @@ norm_pkg() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '._-'; }
 # still hash-checked against the IOC database, which is the right tool for a
 # large binary anyway.
 IOC_SCAN_MAX_BYTES="${SANITYCHECK_IOC_SCAN_MAX_BYTES:-4194304}"
+# The prune list is derived from GREP_EXCLUDES rather than repeated, so the grep
+# and ripgrep paths see exactly the same tree - including during the asar pass,
+# where GREP_EXCLUDES is narrowed to keep bundled node_modules in scope.
 ioc_scan_files() {
-  local prune=(-name .git)
-  # inside an asar the bundled deps are the shipped program, so they stay in
-  if [[ "$ASAR_PASS" != "1" ]]; then
-    prune+=(-o -name node_modules -o -name .venv -o -name venv -o -name __pycache__
-            -o -name .tox -o -name .mypy_cache -o -name .pytest_cache)
-  fi
+  local prune=() e d first=1
+  for e in "${GREP_EXCLUDES[@]}"; do
+    d="${e#--exclude-dir=}"
+    if (( first )); then prune+=(-name "$d"); first=0; else prune+=(-o -name "$d"); fi
+  done
   find "$ROOT" -type d \( "${prune[@]}" \) -prune -o \
        -type f -size -"${IOC_SCAN_MAX_BYTES}"c -print0 2>/dev/null || true
 }
@@ -787,7 +833,7 @@ detect_iocs() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"; local match="${rest#*:}"
       add_finding CRIT ioc-str "$file" "$line" "Contains known IOC marker '$match' (from the IOC database)"
-    done < <(ioc_scan_files | xargs -0 grep -HInaoE -- "$joined" 2>/dev/null | head -n 20 || true)
+    done < <(search_iocs "$joined" | head -n 20 || true)
   fi
   if [[ ${#IOC_SHA[@]} -gt 0 ]]; then
     local art

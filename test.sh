@@ -310,6 +310,32 @@ else
   echo "  (python3 unavailable — skipping asar test)"
 fi
 
+# ripgrep is an optional accelerator, so the two backends must agree exactly -
+# a scanner that finds different things depending on which binary happens to be
+# installed is worse than a slow one. rg also skips hidden files and obeys
+# .gitignore by default, which would silently drop dotfile findings; these
+# fixtures contain .npmrc / .envrc / .pth, so they exercise that.
+echo "engines: grep and ripgrep agree"
+if command -v rg >/dev/null 2>&1; then
+  edump() { # engine fixture
+    SANITYCHECK_SEARCH="$1" "$SC" --offline --json "$FIX/$2" 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(d["verdict"])
+for f in sorted(d["findings"], key=lambda x:(x["tag"],x["file"],x["line"])):
+    print(f["severity"], f["tag"], f["file"], f["line"])'
+  }
+  for efx in chocopoc-lookalike dev-targeting malware-2026; do
+    if [[ "$(edump grep "$efx")" == "$(edump rg "$efx")" ]]; then
+      pass "identical findings on $efx"
+    else
+      fail "grep/rg disagree on $efx"
+    fi
+  done
+else
+  echo "  (rg unavailable — skipping engine-parity test)"
+fi
+
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"
 scan caution-poc --strict; eq "exit (--strict)" "$EXIT" "1"

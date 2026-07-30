@@ -30,7 +30,7 @@ cd sanitycheck
 
 The installer adds the shell hook and PATH entry to your `.zshrc` / `.bashrc`, and installs the deep-pass helper and IOC database.
 
-Requires `bash`, `grep`, `find`. `python3` and an LLM provider are optional.
+Requires `bash`, `grep`, `find`. `python3`, `rg` and an LLM provider are optional.
 
 ## How it works
 
@@ -46,7 +46,7 @@ Each hook asks first (`[Y/n]`, Enter audits, `n` skips); without a terminal it s
 
 Clone is fast because dependencies aren't pulled yet; resolution waits for install, where the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `gradle`) aren't hooked — that's what the clone scan is for.
 
-Core checks are pure shell (`grep`/`find`) and run offline. `python3` adds AST / typosquat / Unicode analysis, dependency resolution, `.asar` unpacking, and `--json`; an LLM adds a second opinion. Missing pieces are skipped, not fatal.
+Core checks are pure shell (`grep`/`find`) and run offline. `python3` adds AST / typosquat / Unicode analysis, dependency resolution, `.asar` unpacking, and `--json`; `rg` is used for the search if installed, roughly 3x faster on large targets; an LLM adds a second opinion. Missing pieces are skipped, not fatal.
 
 Electron apps keep their code in `app.asar`, which a directory walk can't see into. Archives are unpacked and scanned, with findings reported as `app.asar!/index.js`.
 
@@ -164,7 +164,7 @@ A few seconds, offline and deterministic. Unit tests source individual shell fun
 
 Heuristic and text-based — it reads code, it doesn't sandbox it. A `SAFE` verdict isn't proof of safety and a flagged one isn't proof of malice; read the findings, and run untrusted code in a throwaway VM.
 
-macOS and Linux only. A large `.app` bundle takes about a minute, mostly reading framework binaries for IOC strings.
+macOS and Linux only. A 450 MB `.app` bundle takes ~15s with `rg` installed, ~45s without — mostly reading framework binaries for IOC strings.
 
 ## Uninstall
 
