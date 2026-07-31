@@ -93,7 +93,9 @@ Theft and persistence:
 
 General malware (shell, JS, Python, Ruby, Go, Makefiles, Dockerfiles): reverse shells, download-and-exec, destructive ops, miners, exfil channels, keyloggers, shellcode. Windows payloads too — encoded PowerShell in a repo is evidence the repo is malicious even where it can't run.
 
-One signal repeated across many files counts once toward the verdict, so an app shipping six vendored dylibs is a `CAUTION` to read, not a block. Dual-use signals (`eval`, `subprocess`, base64) are `LOW`: visible under `-v` or `--json`, never able to drive a verdict.
+One signal repeated across many files counts once toward the verdict, so an app shipping six vendored dylibs is a `CAUTION` to read, not a block — and prints once, with a file count, rather than six times.
+
+The default report answers "is this safe to run". Dual-use signals (`eval`, `subprocess`, base64) are `LOW`, and the LLM's own caveats about what it didn't check are notes; neither can drive a verdict and both stay behind `-v`. `--json` always contains everything.
 
 ## Direct usage
 

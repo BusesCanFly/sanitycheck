@@ -133,19 +133,9 @@ N_CRIT=0; N_HIGH=0; N_MED=0; N_LOW=0
 demote_for_mode() { # tag sev  ->  echoes a possibly-lowered severity
   local tag="$1" sev="$2"
   # Inside an unpacked .asar the subject is a built application, not a source
-  # tree about to be installed. Nothing in it runs at install time, and its
-  # bundled SDKs name credential paths as a matter of course - an AWS client
-  # mentions .aws/credentials because that is its job, and flagging it buries
-  # the findings that mean something. What survives is runtime behaviour and
-  # embedded payloads: reverse shells, fetch-and-run, IOC hits, import shadowing.
-  if [[ "$ASAR_PASS" == "1" ]]; then
-    case "$tag" in
-      secret-scrape|harvest|wallet|keychain-cli|histfiles|persistence|screencap|\
-      sandbox-check|self-inspect|anti-debug|timestomp|str-obf|lib-inject|\
-      native-vendored|native-load|js-shell-exec|shell-exec|dyn-exec|decode|hex-blob|\
-      install-hook|gyp-exec|dep-links|build-ext|registry-redirect) printf 'LOW'; return ;;
-    esac
-  fi
+  # tree about to be installed - the same situation as an installed dependency,
+  # so it uses the same policy.
+  if [[ "$ASAR_PASS" == "1" ]] && is_context_tag "$tag"; then printf 'LOW'; return; fi
   if [[ "$MODE" == "installer" ]]; then
     # normal-for-installers patterns
     case "$tag" in
@@ -178,6 +168,15 @@ add_finding() { # sev tag file line msg
   case "$SEEN_KEYS" in *"$SEP$key$SEP"*) return 0 ;; esac
   SEEN_KEYS="$SEEN_KEYS$key$SEP"
   local sev; sev="$(demote_for_mode "$2" "$1")"
+  # Installed or built code is scanned like anything else, but a dual-use pattern
+  # in someone else's dependency is not a finding about this project.
+  if [[ "$sev" != "LOW" ]]; then
+    if [[ "$IS_APP_BUNDLE" == "1" ]]; then
+      is_bundle_keep "$2" || sev=LOW
+    elif is_context_tag "$2" && is_vendored_path "$3"; then
+      sev=LOW
+    fi
+  fi
   local tag="$2" file="$3" line="$4" msg="$5"
   F_SEV+=("$sev"); F_TAG+=("$tag"); F_FILE+=("$file"); F_LINE+=("$line"); F_MSG+=("$msg")
   case "$sev" in
@@ -212,14 +211,109 @@ JS="*.js *.mjs *.cjs *.ts"
 # ANY plus build-system files that execute on build/install (gradle=Groovy,
 # build.rs=cargo, Rakefile/extconf.rb/Gemfile=ruby, build.sbt=scala).
 ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile"
-# skip vendored / VCS / build dirs in every tree walk: they aren't the code you
-# wrote (scanning them is slow and false-positive-prone). Matches the deep-pass.
-# NB: do NOT exclude "vendor" - vendored native extensions are exactly where
-# ChocoPoC hides.
-GREP_EXCLUDES=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv
-  --exclude-dir=venv --exclude-dir=__pycache__ --exclude-dir=dist
-  --exclude-dir=build --exclude-dir=.tox --exclude-dir=.mypy_cache
-  --exclude-dir=.pytest_cache)
+# The ONLY things skipped outright, because neither can hide runnable code that
+# the scan would otherwise miss: .git holds compressed VCS objects, and
+# __pycache__ holds byte-compiled copies of .py files already being read.
+#
+# Everything else is scanned - node_modules, site-packages, virtualenvs, build
+# output, vendor. Skipping those is how a trojanned dependency goes unnoticed,
+# and a trojanned dependency is the single most likely thing this tool will ever
+# catch. Installed code is not excluded, it is judged in context: see
+# CONTEXT_TAGS below.
+EXCLUDE_NAMES=(.git __pycache__)
+GREP_EXCLUDES=(); FIND_PRUNE=()
+rebuild_excludes() {
+  GREP_EXCLUDES=(); FIND_PRUNE=()
+  local d first=1
+  for d in "${EXCLUDE_NAMES[@]}"; do
+    GREP_EXCLUDES+=(--exclude-dir="$d")
+    if (( first )); then FIND_PRUNE+=(-name "$d"); first=0
+    else FIND_PRUNE+=(-o -name "$d"); fi
+  done
+}
+rebuild_excludes
+
+# Code that was installed rather than written. Still scanned; only weighted
+# differently. Virtualenvs are found by their pyvenv.cfg rather than by name,
+# since venv, env, .env and virtualenv are all in common use.
+VENDOR_DIRS=()
+discover_venvs() {
+  local cfg n
+  while IFS= read -r cfg; do
+    [[ -n "$cfg" ]] || continue
+    n="$(basename "$(dirname "$cfg")")"
+    case " ${VENDOR_DIRS[*]:-} " in *" $n "*) continue ;; esac
+    VENDOR_DIRS+=("$n")
+    info "treating '$n/' as an installed virtualenv"
+  done < <(find "$ROOT" -maxdepth 6 -type f -name pyvenv.cfg 2>/dev/null || true)
+  return 0
+}
+
+# A prebuilt application is a different question from a source checkout. You are
+# not reviewing code someone is about to install into your interpreter; you are
+# asking whether a finished program is hostile. Almost every capability a rule
+# looks for is one a real application plausibly has for its own reasons: VS Code
+# reads the keychain and talks to the GitHub API, RStudio captures the screen and
+# JITs executable memory, GIMP ships Python plugins, an AI editor contains the
+# literal text "ignore previous instructions" as data, and any app with
+# translations contains bidi characters. Scored like source, all three of those
+# came back DANGEROUS.
+#
+# So for a bundle only the patterns no legitimate application has any reason to
+# contain still count. Everything else drops to LOW - still in --json and -v,
+# just not pretending to be evidence. Source trees are unaffected.
+BUNDLE_KEEP=(ioc-pkg ioc-str ioc-hash reverse-shell macos-inmem gatekeeper
+  tunnel-c2 multi-decode miner backdoor-acct js-fetch-exec py-fetch-exec)
+is_bundle_keep() { [[ " ${BUNDLE_KEEP[*]} " == *" $1 "* ]]; }
+
+IS_APP_BUNDLE=0
+detect_app_bundle() {
+  case "$ROOT" in *.app|*.app/) IS_APP_BUNDLE=1; return 0 ;; esac
+  [[ -d "$ROOT/Contents/MacOS" || -f "$ROOT/Contents/Info.plist" ]] && IS_APP_BUNDLE=1
+  return 0
+}
+
+is_vendored_path() { # path -> 0 if this is installed/built code, not the author's
+  case "$1" in
+    */node_modules/*|*/site-packages/*|*/dist-packages/*|*/.tox/*|*/.eggs/*|\
+    */build/*|*/dist/*|*/.mypy_cache/*|*/.pytest_cache/*) return 0 ;;
+  esac
+  local d
+  for d in "${VENDOR_DIRS[@]:-}"; do
+    [[ -n "$d" ]] && case "$1" in */"$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Tags that only carry meaning when the code is the author's own. In an installed
+# dependency, a built app bundle or a build directory they are unremarkable:
+# urllib3 sets server_hostname, setuptools ships _distutils_hack, an AWS client
+# names .aws/credentials. Reporting those at full severity produced 71 findings
+# on one real checkout, none of them about that project.
+#
+# The unambiguous malware tags are deliberately absent, so they keep full
+# severity wherever they appear: import-shadow, the ioc-* family, reverse-shell,
+# download-exec, *-fetch-exec, multi-decode, macos-inmem, gatekeeper, repo-exfil,
+# devtool-theft, tunnel-c2, llm-evasion, trojan-source, npm-script-exec, miner,
+# keylog, shellcode, exfil-channel, env-gating, pth-exec.
+#
+# An array, not a string: as a multi-line string every tag that happened to sit
+# at the end of a line was followed by a newline rather than a space, so the
+# " $tag " match silently never fired for it. "${CONTEXT_TAGS[*]}" joins on a
+# space regardless of how the source is wrapped.
+CONTEXT_TAGS=(secret-scrape harvest wallet keychain-cli histfiles persistence
+  screencap sandbox-check self-inspect anti-debug timestomp str-obf lib-inject
+  native-vendored native-load js-shell-exec shell-exec dyn-exec decode hex-blob
+  install-hook gyp-exec dep-links build-ext registry-redirect sni-front doh
+  mapbox-c2 persist-pth pth-file npm-install-script conftest-exec direnv
+  py-startup-hook
+  # A compiled module beside a same-named .py is the ChocoPoC trick, and stays
+  # CRIT in a source tree - which is what the pip/clone hooks actually scan.
+  # Inside an already-installed dependency it is also just how lxml and friends
+  # ship a C accelerator next to its pure-Python fallback, and Debian's
+  # python3-lxml alone produced five of them.
+  import-shadow)
+is_context_tag() { [[ " ${CONTEXT_TAGS[*]} " == *" $1 "* ]]; }
 
 load_rules() {
   # install-time code execution (pip/npm runs this; the #1 supply-chain vector)
@@ -286,7 +380,7 @@ load_rules() {
        'Executes shell commands (os.system / subprocess shell=True / pty.spawn)'
 
   # credential / data harvesting
-  rule HIGH harvest      "*.py *.pyx"      'Login Data|cookies\.sqlite|key4\.db|logins\.json|os_crypt|Local State|Keychain|_distutils' \
+  rule HIGH harvest      "*.py *.pyx"      'Login Data|cookies\.sqlite|key4\.db|logins\.json|os_crypt|Local State|Keychain' \
        'Reads browser credential/cookie stores (Login Data / key4.db / cookies)'
   rule HIGH keychain-cli "$ANY"            'security\s+find-generic-password|login\.keychain|secretstorage' \
        'Reads the OS keychain / secret store (macOS Keychain / libsecret)'
@@ -466,6 +560,11 @@ search_iocs() { # ere -> file:line:match  (binaries read as text, size-capped)
   fi
 }
 
+# Per-rule cap on recorded matches. Raised from 40 once dependency trees stopped
+# being skipped: a rule can now legitimately match many vendored files, and a low
+# cap let those crowd out the project's own code.
+RULE_HIT_CAP="${SANITYCHECK_RULE_HIT_CAP:-200}"
+
 run_content_rules() {
   local i n=${#RULE_SEV[@]}
   for ((i=0; i<n; i++)); do
@@ -475,7 +574,7 @@ run_content_rules() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
       add_finding "$sev" "$tag" "$file" "$line" "$msg"
-    done < <(search_rules "$ere" "${gl[@]}" | head -n 40 || true)
+    done < <(search_rules "$ere" "${gl[@]}" | head -n "$RULE_HIT_CAP" || true)
   done
 }
 
@@ -496,10 +595,13 @@ detect_native_shadowing() {
       # node-gyp module ships these. MED so it warns and reads, rather than
       # blocking anything with a dylib in it. import-shadow above is the signal
       # that actually indicts a binary.
+      # No filename in the message - the location line underneath already shows
+      # it, and keeping the text identical lets the report collapse the six
+      # stock dylibs every Electron app ships into one line.
       add_finding MED native-vendored "$so" 0 \
-        "Vendored compiled extension '$base' - binary, not reviewable as source; verify it by hash"
+        "Vendored compiled extension - binary, not reviewable as source; verify it by hash"
     fi
-  done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' \) 2>/dev/null || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' \) -print 2>/dev/null || true)
 }
 
 # --- Electron .asar archives -------------------------------------------------
@@ -591,7 +693,7 @@ extract_asars() {
     fi
     ASAR_DIR+=("$dest"); ASAR_LABEL+=("$(rel "$a")")
     info "asar: unpacked $n files from $(rel "$a")"
-  done < <(find "$ROOT" -type f -name '*.asar' 2>/dev/null | head -n 8 || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name '*.asar' -print 2>/dev/null | head -n 8 || true)
 }
 
 # Run the engine over each unpacked archive. node_modules is excluded from the
@@ -606,8 +708,8 @@ extract_asars() {
 # bundled lifecycle scripts.
 audit_asar_payloads() {
   (( ${#ASAR_DIR[@]} )) || return 0
-  local outer_root="$ROOT" outer_ex=("${GREP_EXCLUDES[@]}") d
-  GREP_EXCLUDES=(--exclude-dir=.git)
+  local outer_root="$ROOT" outer_ex=("${EXCLUDE_NAMES[@]}") d
+  EXCLUDE_NAMES=(.git); rebuild_excludes
   ASAR_PASS=1
   for d in "${ASAR_DIR[@]}"; do
     ROOT="$d"
@@ -616,7 +718,7 @@ audit_asar_payloads() {
     detect_iocs
   done
   ASAR_PASS=0
-  ROOT="$outer_root"; GREP_EXCLUDES=("${outer_ex[@]}")
+  ROOT="$outer_root"; EXCLUDE_NAMES=("${outer_ex[@]}"); rebuild_excludes
 }
 
 # A committed registry token is the author leaking their own credential - not a
@@ -642,21 +744,38 @@ detect_registry_redirect() {
       add_finding MED registry-redirect "$f" "$ln" \
         "Package installs are redirected to '$host' - an install run in this directory fetches code from there rather than the official index"
     done < <(grep -nE '^[^#]*(registry|index-url|extra-index-url)[[:space:]]*=' "$f" 2>/dev/null | head -n 5 || true)
-  done < <(find "$ROOT" -maxdepth 4 -type f \( -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' \
-             -o -name 'pip.conf' -o -name '.pypirc' -o -name 'poetry.toml' \) 2>/dev/null | head -n 20 || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' \
+             -o -name 'pip.conf' -o -name '.pypirc' -o -name 'poetry.toml' \) -print 2>/dev/null | head -n 20 || true)
 }
 
 detect_pth_files() {
   local p
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
-    if grep -qE 'import|exec|eval' "$p" 2>/dev/null; then
+    local pb; pb="$(basename "$p")"
+    # Two stock .pth files legitimately carry an import line and appear in
+    # essentially every Python environment: setuptools' distutils shim, and the
+    # finder pip writes for `pip install -e`. Matched on their exact content, not
+    # just their name, so a .pth an attacker dropped under the same name still
+    # scores CRIT - which is the point of the check.
+    if [[ "$pb" == "distutils-precedence.pth" ]] \
+       && grep -qE "^import os; *var *= *'SETUPTOOLS_USE_DISTUTILS'" "$p" 2>/dev/null; then
+      add_finding LOW pth-file "$p" 0 "setuptools' stock distutils shim - present in every environment"
+    elif [[ "$pb" == __editable__*.pth ]] \
+       && grep -qE '^(import __editable___|/)' "$p" 2>/dev/null; then
+      add_finding LOW pth-file "$p" 0 "pip editable-install finder - written by 'pip install -e'"
+    elif [[ "$pb" == *-nspkg.pth ]] \
+       && grep -qE "^import sys, types, os;.*_getframe\(1\)\.f_locals\['sitedir'\]" "$p" 2>/dev/null; then
+      # setuptools generates one of these for every namespace package - protobuf,
+      # ruamel.yaml, zope, the google.* family. Same generated body every time.
+      add_finding LOW pth-file "$p" 0 "setuptools namespace-package shim - generated for any package using namespace packages"
+    elif grep -qE 'import|exec|eval' "$p" 2>/dev/null; then
       add_finding CRIT pth-exec "$p" 1 \
         ".pth file contains executable 'import' line - runs automatically on every interpreter startup"
     else
       add_finding MED pth-file "$p" 0 ".pth file present - can inject import paths"
     fi
-  done < <(find "$ROOT" -type f -name '*.pth' 2>/dev/null || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name '*.pth' -print 2>/dev/null || true)
 }
 
 detect_npm_scripts() {
@@ -678,7 +797,7 @@ detect_npm_scripts() {
       add_finding CRIT npm-script-exec "$f" "${ln:-0}" \
         'package.json install script downloads/executes remote code, decodes-and-runs a blob, or calls a raw IP - infostealer install vector (Contagious Interview)'
     fi
-  done < <(find "$ROOT" -maxdepth 4 -type f -name 'package.json' 2>/dev/null || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name 'package.json' -print 2>/dev/null || true)
 }
 
 # --- structural: dev-workstation autorun files -------------------------------
@@ -691,7 +810,7 @@ detect_autorun_files() {
     [[ -z "$f" ]] && continue
     add_finding LOW direnv "$f" 0 \
       'direnv .envrc runs when you cd in (after `direnv allow`) - read it before allowing'
-  done < <(find "$ROOT" -maxdepth 3 -type f -name '.envrc' 2>/dev/null || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name '.envrc' -print 2>/dev/null || true)
   # conftest.py - pytest imports & executes it on test collection. Importing
   # subprocess/requests is completely normal in a test suite, so we only flag a
   # conftest that contains high-signal execution/exfil patterns (not the mere
@@ -703,17 +822,25 @@ detect_autorun_files() {
       add_finding HIGH conftest-exec "$f" 0 \
         'conftest.py runs code when pytest collects tests, and here contains shell/exec/download patterns'
     fi
-  done < <(find "$ROOT" -maxdepth 4 -type f -name 'conftest.py' 2>/dev/null || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name 'conftest.py' -print 2>/dev/null || true)
   # sitecustomize.py / usercustomize.py - auto-imported at interpreter startup.
   # Some legitimate tooling (e.g. coverage's subprocess trick) ships one, so a
   # plain hook is MED; only escalate to HIGH on dangerous content.
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
-    local sev=MED
-    grep -qE "$danger" "$f" 2>/dev/null && sev=HIGH
-    add_finding "$sev" py-startup-hook "$f" 0 \
-      "$(basename "$f") is auto-imported at Python startup - an exec/persistence vector when it lands on sys.path"
-  done < <(find "$ROOT" -maxdepth 4 -type f \( -name 'sitecustomize.py' -o -name 'usercustomize.py' \) 2>/dev/null || true)
+    # Split by content, the same way .pth files are, so the dangerous case has
+    # its own tag. A plain startup hook is ordinary enough to be context inside
+    # an installed environment, but one that shells out is a persistence
+    # technique precisely because site-packages is where you would plant it -
+    # and a single shared tag meant the vendored-path rule demoted both.
+    if grep -qE "$danger" "$f" 2>/dev/null; then
+      add_finding HIGH py-startup-exec "$f" 0 \
+        "$(basename "$f") runs shell/exec/download code at every Python startup - a persistence vector wherever it lands on sys.path"
+    else
+      add_finding MED py-startup-hook "$f" 0 \
+        "$(basename "$f") is auto-imported at Python startup - an exec/persistence vector when it lands on sys.path"
+    fi
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name 'sitecustomize.py' -o -name 'usercustomize.py' \) -print 2>/dev/null || true)
 }
 
 # --- dependency manifests + IOC matching -------------------------------------
@@ -798,12 +925,7 @@ IOC_SCAN_MAX_BYTES="${SANITYCHECK_IOC_SCAN_MAX_BYTES:-4194304}"
 # and ripgrep paths see exactly the same tree - including during the asar pass,
 # where GREP_EXCLUDES is narrowed to keep bundled node_modules in scope.
 ioc_scan_files() {
-  local prune=() e d first=1
-  for e in "${GREP_EXCLUDES[@]}"; do
-    d="${e#--exclude-dir=}"
-    if (( first )); then prune+=(-name "$d"); first=0; else prune+=(-o -name "$d"); fi
-  done
-  find "$ROOT" -type d \( "${prune[@]}" \) -prune -o \
+  find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o \
        -type f -size -"${IOC_SCAN_MAX_BYTES}"c -print0 2>/dev/null || true
 }
 
@@ -848,7 +970,7 @@ detect_iocs() {
         fi
         i=$((i+1))
       done
-    done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.asar' \) 2>/dev/null || true)
+    done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.asar' \) -print 2>/dev/null || true)
   fi
 }
 
@@ -994,11 +1116,24 @@ EOF
 }
 
 malware_prompt() {
+  # The summary is read by someone deciding whether to run a download, not by an
+  # analyst. Asking plainly for that stops it coming back as "stock ANGLE and
+  # SwiftShader libraries whose strings contain expected GL/EGL entry points",
+  # which is accurate and tells that reader nothing. Caveats still have somewhere
+  # to go - warnings render as notes, behind -v.
   cat <<'EOF'
-You are a malware analyst reviewing a proof-of-concept exploit and its
-dependencies for supply-chain trojans (the "ChocoPoC" class) and general malware.
-Below are the files a static scanner flagged. Respond with ONLY a JSON object:
+You are reviewing files that a static scanner flagged in something the user is
+about to install or run, looking for supply-chain trojans and general malware.
+
+Respond with ONLY a JSON object:
 {"verdict":"SAFE|CAUTION|DANGEROUS","summary":"one sentence","warnings":["..."]}
+
+The summary is shown to a normal technical user asking "is this safe to run?".
+Write it for them: one plain sentence saying whether you found anything harmful
+and, if so, what it would do to them. No library names, API inventories, file
+format details, or lists of what looked normal - if nothing is wrong, saying so
+briefly is the whole summary. Put anything you could not check, or that you want
+verified by hand, in warnings instead.
 EOF
 }
 
@@ -1066,19 +1201,47 @@ report_human() {
   [[ -n "$LLM_SUMMARY" ]] && { printf '%sllm (%s):%s %s\n' "$B" "${LLM_PROVIDER:-?}" "$Z" "$LLM_SUMMARY"; hdr=1; }
   [[ "$hdr" == "1" ]] && printf '\n'
 
-  local order=(CRIT HIGH MED LOW INFO) want i
+  # What the default report answers is "is this safe to run". LOW findings are
+  # dual-use context that cannot drive a verdict, and INFO is the LLM's own
+  # methodology caveats - what it did not check, what to verify by hand. Both are
+  # worth keeping and neither belongs in front of someone deciding whether to
+  # double-click a download, so both live behind -v.
+  local order=(CRIT HIGH MED LOW INFO) want i j hidden=0
   for want in "${order[@]}"; do
-    [[ "$want" == "LOW" && "$VERBOSE" != "1" ]] && continue
+    if [[ "$VERBOSE" != "1" ]] && [[ "$want" == "LOW" || "$want" == "INFO" ]]; then
+      for ((i=0; i<n; i++)); do [[ "${F_SEV[$i]}" == "$want" ]] && hidden=$((hidden+1)); done
+      continue
+    fi
     for ((i=0; i<n; i++)); do
       [[ "${F_SEV[$i]}" == "$want" ]] || continue
+      local more=0 dup=0
+      # The same finding across many files is one fact. Printing it once per file
+      # buries everything else - six stock Electron dylibs pushed the actual
+      # summary off the top of the screen. -v still lists them individually.
+      if [[ "$VERBOSE" != "1" ]]; then
+        for ((j=0; j<i; j++)); do
+          [[ "${F_SEV[$j]}" == "$want" && "${F_TAG[$j]}" == "${F_TAG[$i]}" \
+             && "${F_MSG[$j]}" == "${F_MSG[$i]}" ]] && { dup=1; break; }
+        done
+        (( dup )) && { hidden=$((hidden+1)); continue; }
+        for ((j=i+1; j<n; j++)); do
+          [[ "${F_SEV[$j]}" == "$want" && "${F_TAG[$j]}" == "${F_TAG[$i]}" \
+             && "${F_MSG[$j]}" == "${F_MSG[$i]}" ]] && more=$((more+1))
+        done
+      fi
       local col; col="$(sev_color "$want")"
       local loc; loc="$(rel "${F_FILE[$i]}")"
       [[ "${F_LINE[$i]}" != "0" ]] && loc="$loc:${F_LINE[$i]}"
+      (( more > 0 )) && loc="$loc  (+$more more files)"
       printf '%s[%s]%s %s%-16s%s %s\n      %s%s%s\n' \
         "$col" "$want" "$Z" "$C" "${F_TAG[$i]}" "$Z" "${F_MSG[$i]}" "$D" "$loc" "$Z"
     done
   done
-  (( N_LOW > 0 && VERBOSE != 1 )) && printf '%s  (+%d LOW findings; -v to show)%s\n' "$D" "$N_LOW" "$Z"
+  # Not on a SAFE result: there the answer is the whole report, and a dangling
+  # "6 things hidden" line only invites a hunt through material that was filed as
+  # unimportant precisely because it is.
+  (( hidden > 0 )) && [[ "$VERDICT" != "SAFE" ]] && \
+    printf '%s  (+%d hidden: LOW findings, notes, repeated files; -v to show)%s\n' "$D" "$hidden" "$Z"
 
   local vc vsym
   case "$VERDICT" in
@@ -1087,10 +1250,12 @@ report_human() {
     *)         vc="$G"; vsym="[+]" ;;
   esac
   printf '\n%s%s VERDICT: %s %s\n' "$vc$B" "$vsym" "$VERDICT" "$Z"
+  # One line each. Nobody reads every flagged file, so telling them to was advice
+  # that got ignored and made the rest look ignorable too.
   case "$VERDICT" in
-    DANGEROUS) printf '%s  Do not install or run this.%s\n' "$R" "$Z" ;;
-    CAUTION)   printf '%s  Read every flagged file before you install or run anything.%s\n' "$Y" "$Z" ;;
-    *)         printf '%s  Nothing suspicious found by static checks.%s\n' "$G" "$Z" ;;
+    DANGEROUS) printf '%s  Known-malicious patterns found!%s\n' "$R" "$Z" ;;
+    CAUTION)   printf '%s  Potential risk - review findings above.%s\n' "$Y" "$Z" ;;
+    *)         printf '%s  No known-malicious patterns found.%s\n' "$G" "$Z" ;;
   esac
   echo
 }
@@ -1350,6 +1515,8 @@ audit_repo_or_file() {
   [[ "$MODE" == "repo" ]] && acquire_repo "$TARGET" || acquire_file "$TARGET"
   [[ -n "$ROOT" ]] || die "could not acquire target: $TARGET"
   load_rules; load_iocs
+  discover_venvs
+  detect_app_bundle
   collect_python_deps
   extract_asars
   run_content_rules
