@@ -4,7 +4,7 @@
 #   1. running a  curl|bash  installer   (zsh only, via the zle line editor)
 #   2. right after  git clone <url>      -> FAST static scan of the checkout
 #   3. right before installing deps      -> DEEP scan (with dependency resolution):
-#        pip, pip3, pipx, npm, yarn, pnpm, poetry, uv
+#        pip, pip3, pipx, npm, yarn, pnpm, poetry, uv, go
 #
 # clone=fast, install=deep: a fresh clone hasn't pulled dependencies yet, and a
 # malicious build script (Makefile, build.rs, setup.py, ...) is already caught by
@@ -124,7 +124,7 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
   # `-e <path>`), and any *named* registry packages.
   # `cmd` stays the real executable (for `command "$cmd" ...`); `disp` is the
   # human name, which grows to include skipped tokens like "uv pip".
-  local sub="" target="" prev="" seen=0 skipped=0 a disp="$cmd"
+  local sub="" target="" prev="" seen=0 skipped=0 a base disp="$cmd"
   local -a pkgs; pkgs=()
   for a in "$@"; do
     if [[ "$a" == -* ]]; then prev="$a"; continue; fi
@@ -137,7 +137,14 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
       sub="$a"; seen=1
     else
       case "$a" in
-        .|./*|../*|/*) [[ -e "$a" ]] && target="$a" ;;   # a local path
+        .|./*|../*|/*)
+          if [[ -e "$a" ]]; then target="$a"              # a local path
+          else
+            # Go package patterns (./... , ./cmd/...) are not paths on disk;
+            # the directory above the wildcard is what to scan.
+            base="${a%/...}"
+            [[ "$base" != "$a" && -e "$base" ]] && target="$base"
+          fi ;;
         *) pkgs+=("$a") ;;                                # a registry package name
       esac
     fi
@@ -164,7 +171,7 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
     # unless something is flagged.
     _sc_ask "audit ${pkgs[*]} before $what?" || { command "$cmd" "$@"; return $?; }
     local eco=""
-    case "$cmd" in pip|pip3|pipx|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; esac
+    case "$cmd" in pip|pip3|pipx|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; go) eco="go" ;; esac
     local -a cka; cka=(--check-pkg)
     [[ -n "$eco" ]] && cka+=(--ecosystem "$eco")
     [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
@@ -226,6 +233,22 @@ uv() {
   # the subcommand and package names parse correctly.
   if [[ "${1:-}" == pip ]]; then _sc_install_guard uv 'install|sync' 0 1 "$@"
   else _sc_install_guard uv 'sync|add|lock' 1 0 "$@"; fi
+}
+# `go install pkg@version` fetches a module and compiles it; `go get` fetches
+# without building. Both pull down code you did not write.
+#
+# Not hooked: `go build` and `go run`. Those are the inner loop of working on a
+# Go project, and prompting on every one of them is how a check gets switched
+# off. `go run pkg@version` does execute a remote module and is a genuine gap -
+# but the clone and install scans are what cover that path.
+go() {
+  # With a subcommand, project=1 so that a bare `go install` (no package, no
+  # path) audits the current module. Without one, project=0 keeps plain `go`
+  # from being treated as an install of the working directory.
+  case "${1:-}" in
+    install|get) _sc_install_guard go 'install|get' 1 0 "$@" ;;
+    *)           _sc_install_guard go 'install|get' 0 0 "$@" ;;
+  esac
 }
 # add another manager in one line, e.g.:
 # bundle()   { _sc_install_guard bundle 'install' 1 0 "$@"; }

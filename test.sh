@@ -169,7 +169,7 @@ echo "hook: install trigger routing (which subcommands scan, and with what args)
 # [Y/n] prompt auto-proceeds, so this exercises routing without a pty.
 trh=$(mktemp -d)
 printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$trh/sc"; chmod +x "$trh/sc"
-for m in npm yarn pnpm poetry uv pip pip3 pipx; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
+for m in npm yarn pnpm poetry uv pip pip3 pipx go; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
 mkdir -p "$trh/proj"; printf '{"name":"p"}\n' >"$trh/proj/package.json"; printf 'requests\n' >"$trh/proj/requirements.txt"
 route() { # expected-substring-or-'PASS'  command...
   local want="$1"; shift
@@ -204,6 +204,14 @@ route "."                          uv sync
 route "--ecosystem pypi x y"      uv pip install x y      # the "pip" token is skipped
 route "."                          uv pip install -r requirements.txt
 route PASSTHROUGH                  uv run script
+# go install/get fetch a module; build and run are the inner dev loop and are
+# deliberately left alone
+route "--ecosystem go github.com/x/y@latest"  go install github.com/x/y@latest
+route "--ecosystem go github.com/x/y"         go get github.com/x/y
+route "."                                     go install ./...
+route PASSTHROUGH                             go build ./...
+route PASSTHROUGH                             go run main.go
+route PASSTHROUGH                             go test ./...
 rm -rf "$trh"
 
 if command -v zsh >/dev/null 2>&1; then
@@ -345,6 +353,18 @@ if command -v script >/dev/null 2>&1; then
 else
   echo "  (script unavailable — skipping spinner regression test)"
 fi
+
+# `go install` never runs the module's code, but it does compile it, and a #cgo
+# directive hands flags to the C toolchain. Ordinary cgo must stay silent or the
+# rule is unusable.
+echo "integration: go-malware -> cgo build-time execution"
+scan go-malware; has cgo-buildflag
+gtmp=$(mktemp -d)
+printf 'package main\n\n/*\n#cgo LDFLAGS: -lm -lpthread\n#cgo CFLAGS: -I/usr/local/include -O2\n*/\nimport "C"\n\nfunc main() {}\n' > "$gtmp/a.go"
+printf 'package main\n\n// #cgo pkg-config: gtk+-3.0\n// #cgo LDFLAGS: -L/usr/lib -lz\nimport "C"\n' > "$gtmp/b.go"
+gv="$("$SC" --offline --json "$gtmp" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])')"
+eq "ordinary cgo flags -> SAFE" "$gv" "SAFE"
+rm -rf "$gtmp"
 
 echo "integration: malware-2026 -> DANGEROUS (current TTPs: fetch-exec, worm exfil, macOS fileless, AI-triage evasion)"
 scan malware-2026; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"

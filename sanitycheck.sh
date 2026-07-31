@@ -45,7 +45,7 @@ TARGET=""
 MODE=""             # installer | repo | file | pkgcheck  (auto-detected)
 ASAR_PASS=0          # scanning inside an unpacked .asar (see demote_for_mode)
 CHECK_PKG=0         # --check-pkg : vet named packages (name IOC + fetch/scan)
-ECOSYSTEM=""        # --ecosystem : pypi | npm  (registry to fetch --check-pkg from)
+ECOSYSTEM=""        # --ecosystem : pypi | npm | go  (registry for --check-pkg)
 PKG_NAMES=()
 
 _HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -321,6 +321,15 @@ load_rules() {
        'setup.py defines an install-time hook (cmdclass/custom install) - runs code on "pip install"'
   rule MED  dep-links    "setup.py"        'dependency_links\s*=|--extra-index-url|--index-url' \
        'Custom package index / dependency_links - can pull attacker-controlled packages'
+  # `go install` does not run the module's code, but it does compile it, and a
+  # #cgo directive feeds flags straight to the C compiler and linker. Go keeps an
+  # allowlist precisely because these turn a build into arbitrary execution:
+  # -fplugin loads a compiler plugin, -specs / -B redirect the toolchain, and
+  # @file reads more flags from a file in the module.
+  rule HIGH cgo-buildflag "*.go" \
+       '^\s*(//\s*)?#cgo\s.{0,100}(-fplugin[=[:space:]]|-specs[=[:space:]]|-B[[:space:]=]*/|@[./]|-Wl,--wrap)' \
+       'cgo directive passes compiler/linker flags that load a plugin or redirect the toolchain - code execution during "go install", before you run anything'
+
   # node-gyp runs binding.gyp during `npm install`. After preinstall/postinstall
   # hooks became the thing everyone watches, weaponised binding.gyp became the
   # way to get the same install-time execution without a lifecycle script.

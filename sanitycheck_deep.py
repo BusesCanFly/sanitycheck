@@ -575,6 +575,30 @@ def _extract_zip(data: bytes, dest: str) -> None:
             files += 1
 
 
+def http_get_json(url: str) -> dict | None:
+    req = urllib.request.Request(url, headers={"User-Agent": "sanitycheck"})
+    try:
+        with urllib.request.urlopen(req, timeout=RESOLVE_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        return {"__http__": e.code}
+    except Exception:
+        return None
+
+
+def go_escape(path: str) -> str:
+    """Module proxy paths are case-encoded: an uppercase letter becomes !<lower>,
+    so github.com/BurntSushi/toml is fetched as github.com/!burnt!sushi/toml."""
+    return re.sub(r"[A-Z]", lambda m: "!" + m.group(0).lower(), path)
+
+
+def go_latest(module: str) -> dict | None:
+    esc = urllib.parse.quote(go_escape(module), safe="/!~.-_")
+    return http_get_json(f"https://proxy.golang.org/{esc}/@latest")
+
+
 def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
     fetched = 0
     for name in names[:FETCH_MAX_PKGS]:
@@ -591,6 +615,29 @@ def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
             pick = next((u for u in urls if u.get("packagetype") == "bdist_wheel"), None) \
                 or next((u for u in urls if u.get("packagetype") == "sdist"), None)
             url = pick.get("url") if pick else None
+        elif ecosystem == "go":
+            # `go install github.com/x/y@v1.2.3` - the version suffix is part of
+            # the argument, not the module path. Strip it and resolve @latest;
+            # pinning to the requested version is not worth a second round trip
+            # when the point is to look at what the module contains.
+            module = name.split("@", 1)[0].rstrip("/")
+            # `go install ./cmd/foo` style paths never reach here (the hook sends
+            # those as a directory scan), but a bare name with no dot in its
+            # first element is a stdlib path and has nothing to fetch.
+            if "." not in module.split("/")[0]:
+                continue
+            meta = go_latest(module)
+            if not meta or meta.get("__http__"):
+                if meta and meta.get("__http__") in (404, 410):
+                    emit("HIGH", "pkg-missing", name, 0,
+                         f"module '{module}' is not on the Go module proxy - "
+                         f"possible dependency-confusion / typo")
+                continue
+            ver = meta.get("Version") or ""
+            if not ver:
+                continue
+            esc = urllib.parse.quote(go_escape(module), safe="/!~.-_")
+            url = f"https://proxy.golang.org/{esc}/@v/{go_escape(ver)}.zip"
         elif ecosystem == "npm":
             meta = npm_metadata(name)
             if not meta or meta.get("__http__"):
@@ -613,7 +660,7 @@ def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
         outdir = os.path.join(dest, re.sub(r"[^A-Za-z0-9._@-]", "_", name))
         os.makedirs(outdir, exist_ok=True)
         try:
-            if url.endswith((".whl", ".zip", ".egg")):
+            if url.endswith((".whl", ".zip", ".egg")) or ecosystem == "go":
                 _extract_zip(data, outdir)
             else:
                 _extract_tar(data, outdir)
@@ -631,7 +678,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--resolve", action="store_true",
                     help="also walk the transitive PyPI dependency graph (network)")
     ap.add_argument("--iocs", default=None, help="IOC db for known-malicious names")
-    ap.add_argument("--fetch", choices=["pypi", "npm"],
+    ap.add_argument("--fetch", choices=["pypi", "npm", "go"],
                     help="download+extract named packages into --dest for scanning")
     ap.add_argument("--dest", help="destination dir for --fetch")
     ap.add_argument("names", nargs="*", help="package names for --fetch")

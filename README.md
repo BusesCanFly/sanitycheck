@@ -40,11 +40,11 @@ With the shell hook enabled, sanitycheck audits automatically:
 |---------|------|
 | `curl \| bash` command line (zsh) | audits the script before it runs |
 | `git clone <url>` | **fast** static scan of the fresh checkout |
-| `pip` / `pip3` / `pipx` / `npm` / `yarn` / `pnpm` / `poetry` / `uv` install | **deep** scan with dependency resolution; aborts on DANGEROUS |
+| `pip` / `pipx` / `npm` / `yarn` / `pnpm` / `poetry` / `uv` install, `go install` / `go get` | **deep** scan with dependency resolution; aborts on DANGEROUS |
 
 Each hook asks first (`[Y/n]`, Enter audits, `n` skips); without a terminal it scans automatically. It never installs, imports, builds, or runs the target.
 
-Clone is fast because dependencies aren't pulled yet; resolution waits for install, where the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `gradle`) aren't hooked — that's what the clone scan is for.
+Clone is fast because dependencies aren't pulled yet; resolution waits for install, where the install latency hides the scan. Build commands (`make`, `cargo build`, `go build`, `go run`, `gradle`) aren't hooked — they run every few seconds while you work, and that's what the clone scan is for.
 
 Core checks are pure shell (`grep`/`find`) and run offline. `python3` adds AST / typosquat / Unicode analysis, dependency resolution, `.asar` unpacking, and `--json`; `rg` is used for the search if installed, roughly 3x faster on large targets; an LLM adds a second opinion. Missing pieces are skipped, not fatal.
 
@@ -67,7 +67,7 @@ Malicious behaviour, not weak configuration: an insecure setting is someone else
 Supply-chain trojans:
 
 - compiled `.so`/`.pyd`/`.node` shadowing a same-named `.py` on import; vendored native extensions; IOC hash matches
-- `setup.py` hooks, `.pth` shims, npm lifecycle scripts, `binding.gyp` build-time execution
+- `setup.py` hooks, `.pth` shims, npm lifecycle scripts, `binding.gyp` and `#cgo` build-time execution
 - typosquatted, known-malicious, or non-existent (dependency-confusion) packages, including transitive ones
 - installs redirected to a non-official registry or index
 
@@ -130,6 +130,8 @@ sanitycheck ~/Downloads/Some.app                                 # app bundle
 Exit codes: `0` SAFE/CAUTION, `1` DANGEROUS, `2` error. `--strict` makes CAUTION exit `1`.
 
 ## Dependency & staged-payload resolution
+
+Named installs are fetched from PyPI, npm or the Go module proxy and their real source is scanned; a name that does not exist there is flagged as possible dependency confusion.
 
 On a repo, sanitycheck walks each dependency's PyPI metadata graph — never building or installing, which would run `setup.py` — and flags malicious, typosquatted, or non-existent transitive deps. This catches `frint → skytext` even when the bad package isn't in your manifest.
 
