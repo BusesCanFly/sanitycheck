@@ -67,8 +67,9 @@ Malicious behaviour, not weak configuration: an insecure setting is someone else
 Supply-chain trojans:
 
 - compiled `.so`/`.pyd`/`.node` shadowing a same-named `.py` on import; vendored native extensions; IOC hash matches
-- `setup.py` hooks, `.pth` shims, npm lifecycle scripts, `binding.gyp` and `#cgo` build-time execution
+- `setup.py` hooks, `.pth` shims, npm lifecycle scripts, `binding.gyp` and `#cgo` build-time execution, `go.mod` toolchain directives
 - typosquatted, known-malicious, or non-existent (dependency-confusion) packages, including transitive ones
+- Go module paths that near-miss a popular one (`boltdb-go/bolt`, `shopsprint/decimal`)
 - installs redirected to a non-official registry or index
 
 Zero-click autorun:

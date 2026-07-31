@@ -330,6 +330,12 @@ load_rules() {
        '^\s*(//\s*)?#cgo\s.{0,100}(-fplugin[=[:space:]]|-specs[=[:space:]]|-B[[:space:]=]*/|@[./]|-Wl,--wrap)' \
        'cgo directive passes compiler/linker flags that load a plugin or redirect the toolchain - code execution during "go install", before you run anything'
 
+  # CVE-2023-39320: a go.mod toolchain directive could run scripts and binaries
+  # relative to the module root when any go command ran inside it. A real value
+  # is a version like go1.21.5, or default/local - never a path.
+  rule HIGH go-toolchain "go.mod" '^\s*toolchain\s+([./]|[^[:space:]]*/)' \
+       'go.mod toolchain directive points at a path rather than a Go version - the toolchain mechanism has been abused to execute code from inside the module (CVE-2023-39320)'
+
   # node-gyp runs binding.gyp during `npm install`. After preinstall/postinstall
   # hooks became the thing everyone watches, weaponised binding.gyp became the
   # way to get the same install-time execution without a lifecycle script.

@@ -22,6 +22,7 @@ Offline checks (always):
   ast-install-exec  exec/eval at import time in setup.py (runs on `pip install`)
   ast-decode-exec   decoded/decompressed data passed straight to exec/eval
   typosquat         a declared dep one edit from a popular package
+  go-typosquat      a go.mod require that is a near-miss for a popular module
   entropy-blob      a long, genuinely high-entropy base64 literal (payload)
 
 Online resolver (--resolve; safe, no code execution):
@@ -337,6 +338,139 @@ def collect_deps(root: Path) -> list[tuple[str, str]]:
                         if km and km.group(1).lower() not in _STOPWORDS:
                             deps.append((km.group(1), rp))
     return deps
+
+
+# --------------------------------------------------------------------------- #
+# Go module typosquatting
+#
+# The dominant real-world attack on Go is a near-miss module path, because Go has
+# no central registry of names - anyone can publish any path they control. Two
+# shapes account for the known cases:
+#   boltdb-go/bolt      vs boltdb/bolt        - decoration added to the owner
+#   shopsprint/decimal  vs shopspring/decimal - one character changed
+# so both a decoration-stripped comparison and an edit-distance comparison are
+# needed; either alone misses half of them.
+# --------------------------------------------------------------------------- #
+
+POPULAR_GO = {
+    "github.com/stretchr/testify", "github.com/sirupsen/logrus",
+    "github.com/spf13/cobra", "github.com/spf13/viper", "github.com/spf13/pflag",
+    "github.com/spf13/afero", "github.com/pkg/errors", "github.com/gorilla/mux",
+    "github.com/gorilla/websocket", "github.com/gin-gonic/gin",
+    "github.com/go-sql-driver/mysql", "github.com/lib/pq",
+    "github.com/google/uuid", "github.com/google/go-cmp",
+    "github.com/mattn/go-sqlite3", "github.com/mattn/go-isatty",
+    "github.com/fatih/color", "github.com/boltdb/bolt", "go.etcd.io/bbolt",
+    "github.com/shopspring/decimal", "github.com/json-iterator/go",
+    "github.com/prometheus/client_golang", "github.com/aws/aws-sdk-go",
+    "github.com/aws/aws-sdk-go-v2", "gopkg.in/yaml.v2", "gopkg.in/yaml.v3",
+    "golang.org/x/crypto", "golang.org/x/net", "golang.org/x/sys",
+    "golang.org/x/text", "golang.org/x/sync", "golang.org/x/time",
+    "golang.org/x/tools", "golang.org/x/oauth2", "golang.org/x/term",
+    "github.com/davecgh/go-spew", "github.com/pmezard/go-difflib",
+    "github.com/cespare/xxhash", "github.com/klauspost/compress",
+    "github.com/urfave/cli", "github.com/hashicorp/go-multierror",
+    "github.com/hashicorp/hcl", "github.com/rs/zerolog", "go.uber.org/zap",
+    "github.com/pelletier/go-toml", "github.com/BurntSushi/toml",
+    "github.com/mitchellh/mapstructure", "github.com/miekg/dns",
+    "github.com/go-chi/chi", "github.com/labstack/echo",
+    "github.com/valyala/fasthttp", "github.com/redis/go-redis",
+    "go.mongodb.org/mongo-driver", "gorm.io/gorm",
+    "github.com/golang-jwt/jwt", "github.com/gofrs/uuid",
+    "github.com/tidwall/gjson", "github.com/olekukonko/tablewriter",
+    "github.com/schollz/progressbar", "github.com/briandowns/spinner",
+    "github.com/charmbracelet/bubbletea", "github.com/charmbracelet/lipgloss",
+    "google.golang.org/grpc", "google.golang.org/protobuf",
+}
+
+# host/owner/repo, followed by a version - matches inside a require ( ) block too
+_GO_MOD_REQ = re.compile(
+    r"^\s*([a-zA-Z0-9][\w.\-]*\.[a-zA-Z]{2,}(?:/[\w.\-~]+)+)\s+v[0-9]", re.M)
+_GO_MOD_MODULE = re.compile(r"^\s*module\s+(\S+)", re.M)
+
+
+def go_norm(path: str) -> str:
+    """Strip the decorations a typosquat adds: separators, a /vN major suffix,
+    and a leading or trailing 'go' on any segment. boltdb-go/bolt and
+    boltdb/bolt both reduce to boltdb/bolt."""
+    p = re.sub(r"/v[0-9]+$", "", path.lower())
+    out = []
+    for seg in p.split("/"):
+        s = re.sub(r"[-_.]", "", seg)
+        if s not in ("go",):                       # keep a segment that IS "go"
+            stripped = re.sub(r"^go|go$", "", s)
+            if stripped:
+                s = stripped
+        out.append(s)
+    return "/".join(out)
+
+
+_POPULAR_GO_NORM = {go_norm(p): p for p in POPULAR_GO}
+
+
+def go_owner(path: str) -> str:
+    """host/owner - the part a typosquat has to differ in to impersonate anyone."""
+    return "/".join(path.lower().split("/")[:2])
+
+
+def go_typosquat(path: str) -> str | None:
+    if path in POPULAR_GO:
+        return None
+    # A /vN suffix is Go's major-version convention, not a near-miss:
+    # github.com/cespare/xxhash/v2 IS github.com/cespare/xxhash. Checked first,
+    # because stripping it is exactly what makes the two collide below.
+    base = re.sub(r"/v[0-9]+$", "", path)
+    if base in POPULAR_GO:
+        return None
+    owner = go_owner(path)
+    norm = go_norm(path)
+    hit = _POPULAR_GO_NORM.get(norm)
+    if hit and hit != path and go_owner(hit) != owner:
+        return hit
+    low = path.lower()
+    for pop in POPULAR_GO:
+        pl = pop.lower()
+        # Same owner is not impersonation - tidwall publishes both gjson and
+        # sjson, one edit apart. Both known attacks (boltdb-go, shopsprint)
+        # differ in the owner segment.
+        if go_owner(pop) == owner:
+            continue
+        # only compare paths of similar shape, or every short path matches
+        if abs(len(pl) - len(low)) <= 1 and 0 < osa_distance(low, pl) <= 1:
+            return pop
+    return None
+
+
+def collect_go_deps(root: Path) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for path in iter_files(root):
+        if path.name != "go.mod":
+            continue
+        text = read_text(path)
+        if not text:
+            continue
+        rp = relpath(path, root)
+        own = _GO_MOD_MODULE.search(text)
+        own_path = own.group(1) if own else ""
+        for m in _GO_MOD_REQ.finditer(text):
+            dep = m.group(1)
+            if dep and dep != own_path:
+                out.append((dep, rp))
+    return out
+
+
+def scan_go_typosquat(root: Path) -> None:
+    seen: set[str] = set()
+    for dep, rp in collect_go_deps(root):
+        if dep in seen:
+            continue
+        seen.add(dep)
+        pop = go_typosquat(dep)
+        if pop:
+            emit("HIGH", "go-typosquat", rp, 0,
+                 f"Module '{dep}' is a near-miss for popular module '{pop}' - "
+                 f"Go has no central name registry, so this is how boltdb-go/bolt "
+                 f"and shopsprint/decimal were delivered")
 
 
 def scan_typosquat(root: Path) -> None:
@@ -708,6 +842,7 @@ def main(argv: list[str]) -> int:
         if ext in UNICODE_EXTS:
             scan_unicode(path, root)
     scan_typosquat(root)
+    scan_go_typosquat(root)
 
     if args.resolve:
         resolve(root, load_malicious_pkgs(args.iocs))

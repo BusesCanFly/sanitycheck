@@ -357,13 +357,31 @@ fi
 # `go install` never runs the module's code, but it does compile it, and a #cgo
 # directive hands flags to the C toolchain. Ordinary cgo must stay silent or the
 # rule is unusable.
-echo "integration: go-malware -> cgo build-time execution"
-scan go-malware; has cgo-buildflag
+echo "integration: go-malware -> DANGEROUS (build-time exec, toolchain, typosquat)"
+scan go-malware; eq "verdict" "$VERDICT" "DANGEROUS"
+for t in cgo-buildflag go-toolchain go-typosquat; do has "$t"; done
+# The FP shapes that matter on real Go code: /vN major-version suffixes are the
+# same module, a same-owner near-miss (tidwall gjson/sjson) is not impersonation,
+# and a real toolchain line names a version rather than a path.
 gtmp=$(mktemp -d)
 printf 'package main\n\n/*\n#cgo LDFLAGS: -lm -lpthread\n#cgo CFLAGS: -I/usr/local/include -O2\n*/\nimport "C"\n\nfunc main() {}\n' > "$gtmp/a.go"
 printf 'package main\n\n// #cgo pkg-config: gtk+-3.0\n// #cgo LDFLAGS: -L/usr/lib -lz\nimport "C"\n' > "$gtmp/b.go"
+cat > "$gtmp/go.mod" <<'GOMOD'
+module github.com/me/thing
+
+go 1.22
+
+toolchain go1.22.3
+
+require (
+	github.com/cespare/xxhash/v2 v2.2.0
+	github.com/golang-jwt/jwt/v5 v5.2.0
+	github.com/tidwall/sjson v1.2.5
+	github.com/stretchr/testify v1.9.0
+)
+GOMOD
 gv="$("$SC" --offline --json "$gtmp" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])')"
-eq "ordinary cgo flags -> SAFE" "$gv" "SAFE"
+eq "ordinary Go project -> SAFE" "$gv" "SAFE"
 rm -rf "$gtmp"
 
 echo "integration: malware-2026 -> DANGEROUS (current TTPs: fetch-exec, worm exfil, macOS fileless, AI-triage evasion)"
