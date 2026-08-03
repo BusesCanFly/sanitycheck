@@ -31,7 +31,14 @@ Online resolver (--resolve; safe, no code execution):
   dep-confusion        a declared dependency does not exist on public PyPI
   pypi-fresh           a declared dependency was published in the last 30 days
 
-Usage:  sanitycheck_deep.py [--resolve] [--iocs FILE] <root-dir>
+Fetch mode (--fetch; download + extract only, still no code execution) pulls
+named packages from PyPI, npm, crates.io or the Go module proxy so the shell can
+scan their real contents. With --resolve it also walks the fetched package's own
+dependency graph, which is how `pip install <dropper>` reaches a payload that
+only appears one level down.
+
+Usage:  sanitycheck_deep.py [--resolve] [--iocs FILE]... <root-dir>
+        sanitycheck_deep.py --fetch pypi|npm|go|crates --dest DIR NAME...
 """
 from __future__ import annotations
 
@@ -188,9 +195,21 @@ def contains_decode_then_exec(call: ast.Call) -> bool:
 # Offline AST checks
 # --------------------------------------------------------------------------- #
 
-def scan_python(path: Path, root: Path) -> None:
-    text = read_text(path)
-    if text is None:
+# Both AST checks below end at `call_name(node) in EXEC_FUNCS`, so a file with no
+# exec/eval call cannot produce a finding no matter what its tree looks like.
+# Parsing it anyway was the single most expensive thing this helper did: on a
+# 6.5k-file checkout, ast.parse cost 2.3s and ast.walk 7.3s across 2076 .py
+# files, of which 50 contain such a call. The substring test comes first because
+# it is ~20x cheaper than the regex and rejects most files outright.
+_EXEC_CALL_RE = re.compile(r"\b(exec|eval)\s*\(")
+
+
+def has_exec_call(text: str) -> bool:
+    return ("exec" in text or "eval" in text) and bool(_EXEC_CALL_RE.search(text))
+
+
+def scan_python(path: Path, root: Path, text: str) -> None:
+    if not has_exec_call(text):
         return
     rp = relpath(path, root)
     try:
@@ -218,35 +237,62 @@ def scan_python(path: Path, root: Path) -> None:
                      "unpacks data and runs it")
 
 
-def scan_unicode(path: Path, root: Path) -> None:
-    text = read_text(path)
-    if text is None:
+# Character-class regexes rather than a Python loop over every character: the two
+# `for i, ch in enumerate(text)` loops this replaces cost 2.4s on a 6.5k-file
+# checkout, and found nothing that a regex does not.
+_BIDI_RE = re.compile("[" + "".join(BIDI_CHARS) + "]")
+_INVISIBLE_RE = re.compile("[" + "".join(INVISIBLE_CHARS) + "]")
+
+# Average line length past which a file is treated as minified/generated.
+_MINIFIED_AVG_LINE = 500
+
+
+def looks_minified(text: str) -> bool:
+    return len(text) > 2000 and len(text) / (text.count("\n") + 1) > _MINIFIED_AVG_LINE
+
+
+def scan_unicode(path: Path, root: Path, text: str) -> None:
+    # Both of these attacks target a human reading the file. Two kinds of file are
+    # never read that way and legitimately full of the characters involved:
+    #
+    #  - minified bundles. CodeMirror emits U+200B deliberately; playwright ships
+    #    two copies of it, which is where three real checkouts picked up a MED.
+    #  - translation catalogues, whose whole content is other people's scripts.
+    #    Qt Linguist files use .ts, the same extension as TypeScript, so the
+    #    extension list alone cannot tell them apart - sniff the XML preamble.
+    if looks_minified(text):
         return
+    if path.suffix.lower() == ".ts" and "<" in text[:200]:
+        head = text.lstrip()[:200]
+        if head.startswith("<?xml") or "<!DOCTYPE TS" in head:
+            return
     # a leading UTF-8 BOM (U+FEFF) is legitimate and extremely common on Windows
     # files; strip it so it is not mistaken for a hidden zero-width character.
     if text.startswith("﻿"):
         text = text[1:]
     rp = relpath(path, root)
-    for i, ch in enumerate(text):
-        if ch in BIDI_CHARS:
-            line = text.count("\n", 0, i) + 1
-            emit("HIGH", "trojan-source", rp, line,
-                 f"Unicode bidirectional control U+{ord(ch):04X} in source - "
-                 f"'Trojan Source' attack: code renders differently to a human "
-                 f"reviewer than it executes")
-            return
-    for i, ch in enumerate(text):
-        if ch in INVISIBLE_CHARS:
-            line = text.count("\n", 0, i) + 1
-            emit("MED", "invisible-unicode", rp, line,
-                 f"Invisible/zero-width character U+{ord(ch):04X} in source - "
-                 f"can hide code or homoglyph an identifier")
-            return
+    m = _BIDI_RE.search(text)
+    if m:
+        emit("HIGH", "trojan-source", rp, text.count("\n", 0, m.start()) + 1,
+             f"Unicode bidirectional control U+{ord(m.group(0)):04X} in source - "
+             f"'Trojan Source' attack: code renders differently to a human "
+             f"reviewer than it executes")
+        return
+    m = _INVISIBLE_RE.search(text)
+    if m:
+        emit("MED", "invisible-unicode", rp, text.count("\n", 0, m.start()) + 1,
+             f"Invisible/zero-width character U+{ord(m.group(0)):04X} in source - "
+             f"can hide code or homoglyph an identifier")
 
 
-def scan_blobs(path: Path, root: Path) -> None:
-    text = read_text(path)
-    if text is None:
+# The finding requires an execution/decode primitive within 120 characters of the
+# blob, so a file that never mentions one anywhere cannot produce it. Checking
+# that first is exact, and skips the scan on most files.
+_NEAR_RE = re.compile(r"\b(exec|eval|compile|marshal|loads|__import__|b64decode)\b")
+
+
+def scan_blobs(path: Path, root: Path, text: str) -> None:
+    if not _NEAR_RE.search(text):
         return
     rp = relpath(path, root)
     for m in B64_RE.finditer(text):
@@ -256,8 +302,7 @@ def scan_blobs(path: Path, root: Path) -> None:
             continue
         line = text.count("\n", 0, m.start()) + 1
         window = text[max(0, m.start() - 120): m.start() + len(blob) + 120]
-        near = re.search(r"\b(exec|eval|compile|marshal|loads|__import__|"
-                         r"b64decode)\b", window)
+        near = _NEAR_RE.search(window)
         # A long base64 literal on its own is data, not behaviour - certificates,
         # icons, test vectors and licence files are full of them. It only says
         # something once it is being fed to an execution or decode primitive.
@@ -491,21 +536,33 @@ def scan_typosquat(root: Path) -> None:
 # Online resolver - safe transitive dependency graph over PyPI JSON metadata
 # --------------------------------------------------------------------------- #
 
-def load_malicious_pkgs(iocs_path: str | None) -> dict[str, str]:
-    """Read `pkg<TAB>name<TAB>note` lines from the IOC db."""
+def load_malicious_pkgs(iocs_paths: str | list[str] | None) -> dict[str, str]:
+    """Read `pkg<TAB>name<TAB>note` lines from every IOC db given.
+
+    Takes a list because --ioc is repeatable on the shell side. It used to take
+    one path and the shell only ever passed the built-in database, so a user's
+    own `--ioc` file was matched by the shell's own name check but invisible to
+    the transitive resolver - the one place it would have caught a name that is
+    not in the manifest.
+    """
     out: dict[str, str] = {}
-    if not iocs_path:
+    if not iocs_paths:
         return out
-    try:
-        with open(iocs_path, encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                if raw.startswith("#") or "\t" not in raw:
-                    continue
-                parts = raw.rstrip("\n").split("\t")
-                if len(parts) >= 2 and parts[0].strip() == "pkg":
-                    out[strip_pkg(parts[1])] = parts[2] if len(parts) > 2 else ""
-    except OSError:
-        pass
+    if isinstance(iocs_paths, str):
+        iocs_paths = [iocs_paths]
+    for path in iocs_paths:
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    if raw.startswith("#") or "\t" not in raw:
+                        continue
+                    parts = raw.rstrip("\n").split("\t")
+                    if len(parts) >= 2 and parts[0].strip() == "pkg":
+                        out[strip_pkg(parts[1])] = parts[2] if len(parts) > 2 else ""
+        except OSError:
+            continue
     return out
 
 
@@ -556,10 +613,15 @@ def newest_upload_days(meta: dict) -> int | None:
         return None
 
 
-def resolve(root: Path, malicious: dict[str, str]) -> None:
+def resolve(root: Path, malicious: dict[str, str], seed: list[str] | None = None) -> None:
+    """Walk the PyPI metadata graph from the declared dependencies of `root`, or
+    from `seed` when the caller already knows the names (a `pip install <name>`,
+    where nothing is on disk to read a manifest from). Seeded or not, the IOC and
+    typosquat checks only fire below depth 0 - the top-level names are already
+    matched by the shell engine."""
     top = []
     seen_top: set[str] = set()
-    for pkg, _rp in collect_deps(root):
+    for pkg in (seed if seed is not None else [p for p, _rp in collect_deps(root)]):
         n = normalize_pkg(pkg)
         if n not in seen_top:
             seen_top.add(n)
@@ -632,6 +694,44 @@ FETCH_MAX_PKGS = 6
 FETCH_ARTIFACT_MAX = 30 * 1024 * 1024      # per-artifact download cap
 EXTRACT_MAX_FILES = 4000
 EXTRACT_MAX_BYTES = 100 * 1024 * 1024
+
+# Where a PEP 440 spec stops being a name: an operator, an extras bracket, an
+# environment marker, or whitespace.
+_PEP440_SPLIT = re.compile(r"[<>=!~;\[\s]")
+_PEP440_PIN = re.compile(r"==\s*([A-Za-z0-9._+!-]+)")
+
+
+def split_spec(spec: str, ecosystem: str) -> tuple[str, str]:
+    """Split a package argument as typed into (name, pinned version).
+
+    The install hooks pass through whatever the user wrote, so this receives
+    `requests==2.31.0`, `requests[socks]`, `lodash@4.17.21` and
+    `github.com/x/y@v1.2.3`. Those used to go into the registry URL whole, which
+    404s - and a 404 is reported as "does not exist on the registry - possible
+    dependency-confusion", so pinning a version invented a HIGH finding against
+    an ordinary install. Returns ("", "") for anything that is not a registry
+    name (VCS URL, local path, option), which the caller skips.
+    """
+    s = spec.strip()
+    if not s or s.startswith("-") or "://" in s:
+        return "", ""
+    if s.startswith((".", "/", "git+", "file:")):
+        return "", ""
+    ver = ""
+    if ecosystem == "pypi":
+        m = _PEP440_SPLIT.search(s)
+        if m:
+            pin = _PEP440_PIN.search(s[m.start():])
+            ver = pin.group(1) if pin else ""
+            s = s[:m.start()]
+    else:
+        # npm "@scope/name@version" and go "module/path@version": the version is
+        # after the LAST @, while a leading @ is an npm scope, not a separator.
+        lead, body = ("@", s[1:]) if s.startswith("@") else ("", s)
+        if "@" in body:
+            body, ver = body.rsplit("@", 1)
+        s = lead + body
+    return s.rstrip("/"), ver
 
 
 def http_get_bytes(url: str, maxsize: int) -> bytes | None:
@@ -735,7 +835,15 @@ def go_latest(module: str) -> dict | None:
 
 def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
     fetched = 0
-    for name in names[:FETCH_MAX_PKGS]:
+    if len(names) > FETCH_MAX_PKGS:
+        skipped = names[FETCH_MAX_PKGS:]
+        emit("LOW", "pkg-uninspected", "requested-packages", 0,
+             f"only the first {FETCH_MAX_PKGS} packages were content-scanned; "
+             f"not inspected: {', '.join(skipped)}")
+    for spec in names[:FETCH_MAX_PKGS]:
+        name, want_ver = split_spec(spec, ecosystem)
+        if not name:
+            continue                 # URL / local path / flag: nothing to look up
         url = None
         if ecosystem == "pypi":
             meta = pypi_metadata(name)
@@ -745,33 +853,52 @@ def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
                          f"package '{name}' does not exist on PyPI - possible "
                          f"dependency-confusion / typo")
                 continue
-            urls = meta.get("urls") or []
+            # A pinned version is what will actually be installed, so it is what
+            # gets scanned; `urls` is whatever PyPI considers current.
+            urls = (meta.get("releases") or {}).get(want_ver) if want_ver else None
+            if not urls:
+                urls = meta.get("urls") or []
             pick = next((u for u in urls if u.get("packagetype") == "bdist_wheel"), None) \
                 or next((u for u in urls if u.get("packagetype") == "sdist"), None)
             url = pick.get("url") if pick else None
         elif ecosystem == "go":
-            # `go install github.com/x/y@v1.2.3` - the version suffix is part of
-            # the argument, not the module path. Strip it and resolve @latest;
-            # pinning to the requested version is not worth a second round trip
-            # when the point is to look at what the module contains.
-            module = name.split("@", 1)[0].rstrip("/")
             # `go install ./cmd/foo` style paths never reach here (the hook sends
             # those as a directory scan), but a bare name with no dot in its
             # first element is a stdlib path and has nothing to fetch.
-            if "." not in module.split("/")[0]:
+            if "." not in name.split("/")[0]:
                 continue
-            meta = go_latest(module)
-            if not meta or meta.get("__http__"):
-                if meta and meta.get("__http__") in (404, 410):
-                    emit("HIGH", "pkg-missing", name, 0,
-                         f"module '{module}' is not on the Go module proxy - "
-                         f"possible dependency-confusion / typo")
-                continue
-            ver = meta.get("Version") or ""
+            ver = want_ver
+            if not ver:
+                meta = go_latest(name)
+                if not meta or meta.get("__http__"):
+                    if meta and meta.get("__http__") in (404, 410):
+                        emit("HIGH", "pkg-missing", name, 0,
+                             f"module '{name}' is not on the Go module proxy - "
+                             f"possible dependency-confusion / typo")
+                    continue
+                ver = meta.get("Version") or ""
             if not ver:
                 continue
-            esc = urllib.parse.quote(go_escape(module), safe="/!~.-_")
+            esc = urllib.parse.quote(go_escape(name), safe="/!~.-_")
             url = f"https://proxy.golang.org/{esc}/@v/{go_escape(ver)}.zip"
+        elif ecosystem == "crates":
+            # `cargo install` compiles what it fetches, and build.rs runs during
+            # that compile - the same install-time execution as setup.py.
+            ver = want_ver
+            if not ver:
+                meta = http_get_json(f"https://crates.io/api/v1/crates/{urllib.parse.quote(name, safe='')}")
+                if not meta or meta.get("__http__"):
+                    if meta and meta.get("__http__") == 404:
+                        emit("HIGH", "pkg-missing", name, 0,
+                             f"crate '{name}' does not exist on crates.io - "
+                             f"possible dependency-confusion / typo")
+                    continue
+                ver = ((meta.get("crate") or {}).get("max_stable_version")
+                       or (meta.get("crate") or {}).get("newest_version") or "")
+            if not ver:
+                continue
+            url = (f"https://crates.io/api/v1/crates/"
+                   f"{urllib.parse.quote(name, safe='')}/{urllib.parse.quote(ver, safe='')}/download")
         elif ecosystem == "npm":
             meta = npm_metadata(name)
             if not meta or meta.get("__http__"):
@@ -780,9 +907,10 @@ def fetch_packages(ecosystem: str, dest: str, names: list[str]) -> int:
                          f"package '{name}' does not exist on the npm registry - "
                          f"possible dependency-confusion / typo")
                 continue
-            latest = (meta.get("dist-tags") or {}).get("latest") or ""
-            ver = (meta.get("versions") or {}).get(latest, {})
-            url = ((ver.get("dist") or {}).get("tarball"))
+            versions = meta.get("versions") or {}
+            pick_ver = want_ver if want_ver in versions else \
+                (meta.get("dist-tags") or {}).get("latest") or ""
+            url = ((versions.get(pick_ver, {}).get("dist") or {}).get("tarball"))
         if not url:
             continue
         data = http_get_bytes(url, FETCH_ARTIFACT_MAX)
@@ -811,8 +939,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("root", nargs="?")
     ap.add_argument("--resolve", action="store_true",
                     help="also walk the transitive PyPI dependency graph (network)")
-    ap.add_argument("--iocs", default=None, help="IOC db for known-malicious names")
-    ap.add_argument("--fetch", choices=["pypi", "npm", "go"],
+    ap.add_argument("--iocs", action="append", default=None,
+                    help="IOC db for known-malicious names (repeatable)")
+    ap.add_argument("--fetch", choices=["pypi", "npm", "go", "crates"],
                     help="download+extract named packages into --dest for scanning")
     ap.add_argument("--dest", help="destination dir for --fetch")
     ap.add_argument("names", nargs="*", help="package names for --fetch")
@@ -825,6 +954,15 @@ def main(argv: list[str]) -> int:
         names = ([args.root] if args.root else []) + (args.names or [])
         if args.dest and names:
             fetch_packages(args.fetch, args.dest, names)
+            # `pip install <dropper>` fetches and scans the dropper, but the
+            # ChocoPoC shape is a clean-looking package whose *dependency* is the
+            # payload - frint -> skytext. That walk only ran for repos, so the
+            # case the tool is named after was missed on the install path.
+            # PyPI-only, because the resolver is PyPI JSON metadata.
+            if args.resolve and args.fetch == "pypi":
+                seed = [n for n, _v in (split_spec(s, "pypi") for s in names) if n]
+                if seed:
+                    resolve(Path(args.dest), load_malicious_pkgs(args.iocs), seed=seed)
         return 0
 
     if not args.root:
@@ -833,14 +971,26 @@ def main(argv: list[str]) -> int:
     if not root.is_dir():
         return 0  # stay silent so the shell tool is unaffected
 
+    # One read per file, shared by every scanner that wants it. Each used to open
+    # and decode the file itself, so a .py went through read_text three times.
+    # Reading every text file in a 6.5k-file checkout costs 0.44s, so the I/O was
+    # never the problem - doing it three times over was.
     for path in iter_files(root):
         ext = path.suffix.lower()
-        if ext in (".py", ".pyw", ".pyx"):
-            scan_python(path, root)
-        if ext in TEXT_EXTS:
-            scan_blobs(path, root)
-        if ext in UNICODE_EXTS:
-            scan_unicode(path, root)
+        want_py = ext in (".py", ".pyw", ".pyx")
+        want_blob = ext in TEXT_EXTS
+        want_uni = ext in UNICODE_EXTS
+        if not (want_py or want_blob or want_uni):
+            continue
+        text = read_text(path)
+        if text is None:
+            continue
+        if want_py:
+            scan_python(path, root, text)
+        if want_blob:
+            scan_blobs(path, root, text)
+        if want_uni:
+            scan_unicode(path, root, text)
     scan_typosquat(root)
     scan_go_typosquat(root)
 

