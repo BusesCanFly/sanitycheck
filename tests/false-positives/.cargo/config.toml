@@ -1,0 +1,9 @@
+[target.thumbv7em-none-eabihf]
+runner = "probe-run --chip STM32F411RETx"
+linker = "arm-none-eabi-gcc"
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

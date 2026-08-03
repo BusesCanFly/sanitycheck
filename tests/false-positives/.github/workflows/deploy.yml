@@ -1,0 +1,12 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Cloudflare Pages build
+        run: curl -X POST "https://api.cloudflare.com/client/v4/pages/webhooks/deploy_hooks/${{ secrets.CF_DEPLOY_HOOK }}"
+      - name: Publish
+        run: curl -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" -d @payload.json https://api.example.com/release
