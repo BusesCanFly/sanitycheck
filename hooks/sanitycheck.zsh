@@ -157,6 +157,26 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
   [[ -z "$sub" && "$project" == 1 ]] && trigger=1
   [[ "$trigger" == 1 ]] || { command "$cmd" "$@"; return $?; }
 
+  # A registry redirect given on the command line (pip --index-url,
+  # npm --registry) aims installs at a non-official host with no config file for
+  # detect_registry_redirect to catch. Surface it - the same MED-level signal,
+  # noted at the moment it matters.
+  local ra rprev="" rhost=""
+  for ra in "$@"; do
+    case "$rprev" in --index-url|--extra-index-url|-i|--registry) rhost="$ra" ;; esac
+    case "$ra" in --index-url=*|--extra-index-url=*|--registry=*) rhost="${ra#*=}" ;; esac
+    rprev="$ra"
+  done
+  if [[ "$rhost" == *://* ]]; then
+    local rh="${rhost#*://}"; rh="${rh%%/*}"; rh="${rh##*@}"; rh="${rh%%:*}"
+    case "$rh" in
+      registry.npmjs.org|registry.yarnpkg.com|npm.pkg.github.com|\
+      pypi.org|files.pythonhosted.org|pypi.python.org|test.pypi.org) ;;
+      '') ;;
+      *) _sc_say "note: installs are being redirected to '$rh' (not the official registry)" ;;
+    esac
+  fi
+
   # bare project install (no path, no named pkg) audits the cwd project
   [[ -z "$target" && "$project" == 1 && ${#pkgs[@]} -eq 0 ]] && target="."
 
@@ -195,6 +215,35 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
   fi
   command "$cmd" "$@"
 }
+
+# Guard for the download-and-RUN commands: npx / yarn dlx / pnpm dlx / bunx / uvx
+# / uv tool run. These fetch a package and execute it immediately - strictly more
+# dangerous than installing it - and unlike an install there is no subcommand:
+# the package to run is the first non-flag token (after `skip` leading tokens,
+# e.g. the `dlx` in `yarn dlx`). Routes to the same --check-pkg name+content vet.
+_sc_runner_guard() {  # display  real-cmd  ecosystem  skip  args...
+  local disp="$1" cmd="$2" eco="$3" skip="$4"; shift 4
+  local bin; bin="$(_sanitycheck_bin)"
+  [[ "$SANITYCHECK_HOOK" == "1" && -n "$bin" ]] || { command "$cmd" "$@"; return $?; }
+  local a prev="" skipped=0 pkg=""
+  for a in "$@"; do
+    # an explicit -p/--package <pkg> names the package directly
+    case "$prev" in -p|--package) pkg="$a"; break ;; esac
+    if [[ "$a" == -* ]]; then prev="$a"; continue; fi
+    if (( skipped < skip )); then skipped=$((skipped+1)); prev="$a"; continue; fi
+    pkg="$a"; break
+  done
+  [[ -n "$pkg" ]] || { command "$cmd" "$@"; return $?; }
+  _sc_ask "audit '$pkg' before $disp runs it?" || { command "$cmd" "$@"; return $?; }
+  local -a cka; cka=(--check-pkg --ecosystem "$eco")
+  [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
+  "$bin" "${cka[@]}" "$pkg"; local rc=$?
+  if [[ $rc -eq 1 ]]; then
+    if [[ "${SANITYCHECK_HOOK_STRICT:-0}" == "1" ]]; then _sc_say "$disp aborted (DANGEROUS)."; return 1; fi
+    _sc_ask_risky "DANGEROUS - run $disp anyway?" || { _sc_say "$disp aborted."; return 1; }
+  fi
+  command "$cmd" "$@"
+}
 # These wrappers shadow real command names. zsh expands aliases at parse time,
 # so a matching `alias pip=...` would break a bare `pip() { ... }` definition and
 # abort the hook while it is being sourced. Turn alias expansion off just while
@@ -207,38 +256,86 @@ else
 fi
 
 git() {
+  # Fail open: a function shadowing git must never break git. If the helper did
+  # not travel with this wrapper (e.g. only the function body was captured),
+  # fall straight through to the real command.
+  typeset -f _sanitycheck_bin >/dev/null 2>&1 || { command git "$@"; return $?; }
   local bin; bin="$(_sanitycheck_bin)"
-  if [[ "$SANITYCHECK_HOOK" != "1" || -z "$bin" || "${1:-}" != "clone" ]]; then
+  if [[ "$SANITYCHECK_HOOK" != "1" || -z "$bin" ]]; then
     command git "$@"; return $?
   fi
-  command git "$@" || return $?
-  # destination = last non-flag arg after `clone` (or the repo's basename)
-  local dest="" a first=1
+
+  # Find the subcommand, skipping leading global options and any value they take
+  # (`git -C <dir> clone`, `git -c k=v clone`), so those forms still hook rather
+  # than bypassing. Everything after the subcommand is collected for parsing.
+  local a sub="" seen_sub=0 want_val=0
+  local -a rest=()
   for a in "$@"; do
-    [[ "$first" == "1" ]] && { first=0; continue; }
-    [[ "$a" == -* ]] || dest="$a"
+    if [[ "$seen_sub" == 1 ]]; then rest+=("$a"); continue; fi
+    if (( want_val )); then want_val=0; continue; fi
+    case "$a" in
+      -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix) want_val=1 ;;
+      --git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|--super-prefix=*|-*) : ;;
+      *) sub="$a"; seen_sub=1 ;;
+    esac
   done
-  if [[ "$dest" == *://* || "$dest" == *@*:* || "$dest" == *.git ]]; then
-    dest="$(basename "${dest%.git}")"
-  fi
+  [[ "$sub" == "clone" ]] || { command git "$@"; return $?; }
+
+  command git "$@" || return $?
+
+  # Parse clone's positional args, skipping value-taking options so a branch,
+  # depth or origin value is never mistaken for the destination directory:
+  #   git clone [options] <repo> [<dir>]
+  local repo="" dest="" np=0
+  want_val=0
+  for a in "${rest[@]}"; do
+    if (( want_val )); then want_val=0; continue; fi
+    case "$a" in
+      -b|--branch|-o|--origin|-u|--upload-pack|-c|--config|--depth|--reference|\
+      --reference-if-able|-j|--jobs|--template|--separate-git-dir|--filter|\
+      --shallow-since|--shallow-exclude|--server-option|--bundle-uri) want_val=1 ;;
+      -*) : ;;
+      *) np=$((np+1)); if (( np == 1 )); then repo="$a"; elif (( np == 2 )); then dest="$a"; fi ;;
+    esac
+  done
+  # No explicit target dir: git derives it from the repo's basename.
+  [[ -z "$dest" ]] && dest="$(basename "${repo%.git}")"
   [[ -d "$dest" ]] || return 0
   _sc_ask "audit '$dest'?" || return 0
   "$bin" --fast "$dest" || true      # clone=fast: dependencies aren't pulled yet
   return 0
 }
 
-pip()    { _sc_install_guard pip    'install'             0 0 "$@"; }
-pip3()   { _sc_install_guard pip3   'install'             0 0 "$@"; }
-pipx()   { _sc_install_guard pipx   'install|inject|run'  0 0 "$@"; }
-npm()    { _sc_install_guard npm    'install|i|ci|add' 1 0 "$@"; }
-yarn()   { _sc_install_guard yarn   'install|add'      1 0 "$@"; }
-pnpm()   { _sc_install_guard pnpm   'install|i|add'    1 0 "$@"; }
-poetry() { _sc_install_guard poetry 'install|add|sync' 1 0 "$@"; }
+# Every wrapper fails open the same way: if _sc_install_guard did not travel with
+# the function body, delegate to the real command rather than break it. The check
+# is `typeset` (a builtin, always present) inline in each body, so a missing
+# helper never even prints a "command not found" - it just falls through.
+pip()    { typeset -f _sc_install_guard >/dev/null 2>&1 || { command pip    "$@"; return $?; }; _sc_install_guard pip    'install'             0 0 "$@"; }
+pip3()   { typeset -f _sc_install_guard >/dev/null 2>&1 || { command pip3   "$@"; return $?; }; _sc_install_guard pip3   'install'             0 0 "$@"; }
+pipx()   { typeset -f _sc_install_guard >/dev/null 2>&1 || { command pipx   "$@"; return $?; }; _sc_install_guard pipx   'install|inject|run'  0 0 "$@"; }
+npm()    { typeset -f _sc_install_guard >/dev/null 2>&1 || { command npm    "$@"; return $?; }; _sc_install_guard npm    'install|i|ci|add' 1 0 "$@"; }
+yarn()   {
+  typeset -f _sc_install_guard >/dev/null 2>&1 || { command yarn "$@"; return $?; }
+  if [[ "${1:-}" == dlx ]]; then _sc_runner_guard 'yarn dlx' yarn npm 1 "$@"
+  else _sc_install_guard yarn 'install|add' 1 0 "$@"; fi
+}
+pnpm()   {
+  typeset -f _sc_install_guard >/dev/null 2>&1 || { command pnpm "$@"; return $?; }
+  if [[ "${1:-}" == dlx ]]; then _sc_runner_guard 'pnpm dlx' pnpm npm 1 "$@"
+  else _sc_install_guard pnpm 'install|i|add' 1 0 "$@"; fi
+}
+# The download-and-run commands. npx/bunx run npm packages; uvx runs a PyPI tool.
+npx()    { typeset -f _sc_runner_guard >/dev/null 2>&1 || { command npx  "$@"; return $?; }; _sc_runner_guard npx  npx  npm  0 "$@"; }
+bunx()   { typeset -f _sc_runner_guard >/dev/null 2>&1 || { command bunx "$@"; return $?; }; _sc_runner_guard bunx bunx npm  0 "$@"; }
+uvx()    { typeset -f _sc_runner_guard >/dev/null 2>&1 || { command uvx  "$@"; return $?; }; _sc_runner_guard uvx  uvx  pypi 0 "$@"; }
+poetry() { typeset -f _sc_install_guard >/dev/null 2>&1 || { command poetry "$@"; return $?; }; _sc_install_guard poetry 'install|add|sync' 1 0 "$@"; }
 uv() {
+  typeset -f _sc_install_guard >/dev/null 2>&1 || { command uv "$@"; return $?; }
   # uv has two shapes: native (`uv add|sync|lock`) and a pip passthrough
   # (`uv pip install|sync ...`). For the latter, skip the leading "pip" token so
   # the subcommand and package names parse correctly.
   if [[ "${1:-}" == pip ]]; then _sc_install_guard uv 'install|sync' 0 1 "$@"
+  elif [[ "${1:-}" == tool && "${2:-}" == run ]]; then _sc_runner_guard 'uv tool run' uv pypi 2 "$@"
   else _sc_install_guard uv 'sync|add|lock' 1 0 "$@"; fi
 }
 # `go install pkg@version` fetches a module and compiles it; `go get` fetches
@@ -249,6 +346,7 @@ uv() {
 # off. `go run pkg@version` does execute a remote module and is a genuine gap -
 # but the clone and install scans are what cover that path.
 go() {
+  typeset -f _sc_install_guard >/dev/null 2>&1 || { command go "$@"; return $?; }
   # With a subcommand, project=1 so that a bare `go install` (no package, no
   # path) audits the current module. Without one, project=0 keeps plain `go`
   # from being treated as an install of the working directory.
@@ -262,10 +360,10 @@ go() {
 # script, on a toolchain nobody thinks of as one. `cargo build`/`test`/`run` are
 # deliberately not hooked, for the same reason `go build` is not: they are the
 # inner loop, and a check that fires every few seconds gets switched off.
-cargo()  { _sc_install_guard cargo  'install|add'     1 0 "$@"; }
+cargo()  { typeset -f _sc_install_guard >/dev/null 2>&1 || { command cargo  "$@"; return $?; }; _sc_install_guard cargo  'install|add'     1 0 "$@"; }
 # No registry fetch for these two, so they get the offline name check only.
-gem()    { _sc_install_guard gem    'install'         0 0 "$@"; }
-bundle() { _sc_install_guard bundle 'install|add'     1 0 "$@"; }
+gem()    { typeset -f _sc_install_guard >/dev/null 2>&1 || { command gem    "$@"; return $?; }; _sc_install_guard gem    'install'         0 0 "$@"; }
+bundle() { typeset -f _sc_install_guard >/dev/null 2>&1 || { command bundle "$@"; return $?; }; _sc_install_guard bundle 'install|add'     1 0 "$@"; }
 # add another manager in one line, e.g.:
 # composer() { _sc_install_guard composer 'install|require|update' 1 0 "$@"; }
 

@@ -533,6 +533,86 @@ def scan_typosquat(root: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# npm package.json dependency typosquatting
+#
+# collect_deps reads only Python manifests, so package.json dependencies went
+# unexamined - while npm is where the worm/typosquat activity actually is. The
+# shape is the same as PyPI: a declared name one edit from a popular one.
+# --------------------------------------------------------------------------- #
+
+POPULAR_NPM = {
+    "react", "react-dom", "lodash", "express", "chalk", "axios", "commander",
+    "debug", "next", "vue", "typescript", "webpack", "request", "moment",
+    "async", "bluebird", "underscore", "jquery", "eslint", "prettier", "dotenv",
+    "uuid", "yargs", "glob", "rimraf", "mkdirp", "semver", "colors", "minimist",
+    "node-fetch", "cross-env", "ws", "mongoose", "redux", "vite", "rollup",
+    "jest", "mocha", "chai", "tslib", "classnames", "styled-components", "cookie",
+    "body-parser", "cors", "dayjs", "socket.io", "nodemon", "typeorm", "ejs",
+    "bcrypt", "jsonwebtoken", "winston", "inquirer", "puppeteer", "ora",
+}
+_POPULAR_NPM_NORM = {normalize_pkg(p): p for p in POPULAR_NPM}
+
+
+def is_npm_typosquat(norm: str) -> str | None:
+    if norm in _POPULAR_NPM_NORM:
+        return None
+    for pop_norm, pop in _POPULAR_NPM_NORM.items():
+        # Short names (cors, jest, vue, ws, ...) sit one edit from too many real
+        # packages (core, nest, test), so near-miss matching on them is all false
+        # positives. Below the floor an exact match is the only signal, and an
+        # exact match is the popular package itself - already handled above.
+        if len(pop_norm) < 5:
+            continue
+        if 0 < osa_distance(norm, pop_norm) <= 1 and abs(len(norm) - len(pop_norm)) <= 1:
+            return pop
+    return None
+
+
+# The manifest keys npm installs from. A scoped name (@scope/pkg) is namespaced
+# and not compared against the unscoped popular set - different string, no match.
+_NPM_DEP_KEYS = ("dependencies", "devDependencies", "optionalDependencies",
+                 "peerDependencies")
+
+
+def collect_npm_deps(root: Path) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for path in iter_files(root):
+        if path.name != "package.json":
+            continue
+        text = read_text(path)
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        rp = relpath(path, root)
+        for key in _NPM_DEP_KEYS:
+            table = data.get(key)
+            if isinstance(table, dict):
+                for name in table:
+                    if isinstance(name, str) and name:
+                        out.append((name, rp))
+    return out
+
+
+def scan_npm_typosquat(root: Path) -> None:
+    seen: set[str] = set()
+    for pkg, rp in collect_npm_deps(root):
+        norm = normalize_pkg(pkg)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        pop = is_npm_typosquat(norm)
+        if pop:
+            emit("HIGH", "typosquat", rp, 0,
+                 f"npm dependency '{pkg}' is one edit from popular package "
+                 f"'{pop}' - possible typosquat")
+
+
+# --------------------------------------------------------------------------- #
 # Online resolver - safe transitive dependency graph over PyPI JSON metadata
 # --------------------------------------------------------------------------- #
 
@@ -785,7 +865,13 @@ def _extract_tar(data: bytes, dest: str) -> None:
             if m.isfile():
                 total += max(m.size, 0)
             try:
-                tf.extract(m, dest)
+                # filter="data" (Python 3.12+) sanitizes paths, ownership and
+                # permissions on top of the _within check above; older
+                # interpreters do not accept the argument, so fall back.
+                try:
+                    tf.extract(m, dest, filter="data")
+                except TypeError:
+                    tf.extract(m, dest)
             except Exception:
                 continue
             files += 1
@@ -944,8 +1030,43 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--fetch", choices=["pypi", "npm", "go", "crates"],
                     help="download+extract named packages into --dest for scanning")
     ap.add_argument("--dest", help="destination dir for --fetch")
-    ap.add_argument("names", nargs="*", help="package names for --fetch")
+    ap.add_argument("--check-names", choices=["pypi", "npm", "go"],
+                    help="offline typosquat check of NAME... for an ecosystem")
+    ap.add_argument("names", nargs="*", help="package names for --fetch/--check-names")
     args = ap.parse_args(argv[1:])
+
+    # check-names mode: pure, offline typosquat check on names typed on a command
+    # line (a `pip/npm install <name>`). The moment a typo happens is when the
+    # command is typed, and nothing is on disk yet, so this needs no directory and
+    # no network - it just runs the same near-miss check used on manifests.
+    if args.check_names:
+        names = ([args.root] if args.root else []) + (args.names or [])
+        eco = args.check_names
+        seen: set[str] = set()
+        for spec in names:
+            name, _ver = split_spec(spec, eco)
+            if not name:
+                continue
+            if eco == "go":
+                if name in seen:
+                    continue
+                seen.add(name)
+                pop = go_typosquat(name)
+                if pop:
+                    emit("HIGH", "go-typosquat", name, 0,
+                         f"Module '{name}' is a near-miss for popular module "
+                         f"'{pop}' - possible typosquat")
+            else:
+                norm = normalize_pkg(name)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                pop = is_npm_typosquat(norm) if eco == "npm" else is_typosquat(norm)
+                if pop:
+                    emit("HIGH", "typosquat", name, 0,
+                         f"'{name}' is one edit from popular package '{pop}' - "
+                         f"possible typosquat")
+        return 0
 
     # fetch mode: download + extract registry packages (no execution) so the
     # shell can scan their real contents. argparse puts the first positional in
@@ -993,6 +1114,7 @@ def main(argv: list[str]) -> int:
             scan_unicode(path, root, text)
     scan_typosquat(root)
     scan_go_typosquat(root)
+    scan_npm_typosquat(root)
 
     if args.resolve:
         resolve(root, load_malicious_pkgs(args.iocs))

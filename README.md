@@ -150,6 +150,8 @@ sanitycheck ~/Downloads/Some.AppImage                            # AppImage
 | `--strict` | Exit nonzero on `CAUTION` too (CI gate) |
 | `--json` | Machine-readable report |
 | `--ioc FILE` | Extra IOC database (repeatable) |
+| `--check-pkg NAME...` | Vet package name(s) against IOCs and typosquats; when online, download and scan their real contents (what the install hook uses) |
+| `--ecosystem ECO` | Registry for `--check-pkg`: `pypi`, `npm`, `go`, or `crates` |
 | `--provider P` | LLM provider (`auto`, `ollama`, `claude-api`, `openai`, `claude-cli`) |
 | `--model NAME` | Model name |
 | `-o, --output DIR` | Keep files in DIR instead of a tmpdir |

