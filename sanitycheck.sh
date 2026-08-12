@@ -1762,10 +1762,13 @@ report_human() {
       fk="${F_FILE[$i]}"
       case "$seen_all" in *"$SEP$fk$SEP"*) ;; *) seen_all="$seen_all$fk$SEP"; files_total=$((files_total+1)) ;; esac
     done
-    local nf=$((N_CRIT+N_HIGH+N_MED))
-    printf '    %s%d finding%s in %d file%s - "-v" for detail%s\n' \
+    local nf=$((N_CRIT+N_HIGH+N_MED)) hint='"-v" for detail'
+    # When we are about to prompt to run this (installer -r flow, e.g. under the
+    # hook), the user can't re-invoke with -v - so point at the prompt key instead.
+    [[ "$RUN_AFTER" == "1" && "$MODE" == "installer" ]] && hint='press v below for detail'
+    printf '    %s%d finding%s in %d file%s - %s%s\n' \
       "$D" "$nf" "$( ((nf==1)) || printf s )" \
-      "$files_total" "$( ((files_total==1)) || printf s )" "$Z"
+      "$files_total" "$( ((files_total==1)) || printf s )" "$hint" "$Z"
   fi
   echo
 }
@@ -2172,17 +2175,29 @@ run_installer_now() {
 
 maybe_run_installer() {
   [[ "$RUN_AFTER" == "1" && "$MODE" == "installer" ]] || return 0
-  local prompt ans
+  local q keys go ans was_verbose="$VERBOSE"
+  # Offer an inline "expand" key only when there is hidden detail and the report
+  # wasn't already printed in full (-v). Under the hook the user can't re-run with
+  # -v, so `v` reprints the report with every finding, then asks again.
+  local vk="" vlabel=""
+  (( ${#F_SEV[@]} > 0 )) && [[ "$VERBOSE" != "1" ]] && { vk="v"; vlabel="/v"; }
   case "$VERDICT" in
-    SAFE)      prompt='Run the script? [Y/n] ' ;;
-    DANGEROUS) prompt="${R}Run despite DANGEROUS verdict?${Z} [y/N] " ;;
-    *)         prompt='Run the script? [y/N] ' ;;
+    SAFE)      q='Run the script?'; keys="[Y/n$vlabel]"; go=yes ;;
+    DANGEROUS) q="${R}Run despite DANGEROUS verdict?${Z}"; keys="[y/N$vlabel]"; go=no ;;
+    *)         q='Run the script?'; keys="[y/N$vlabel]"; go=no ;;
   esac
-  printf '%s' "$prompt"; read -r ans
-  case "$VERDICT" in
-    SAFE) [[ "$ans" == [Nn]* ]] && { echo "Aborted."; KEEP=1; } || run_installer_now ;;
-    *)    [[ "$ans" == [Yy]* ]] && run_installer_now || { echo "Aborted."; KEEP=1; } ;;
-  esac
+  while :; do
+    printf '%s %s ' "$q" "$keys"; read -r ans
+    if [[ -n "$vk" && "$ans" == [Vv]* ]]; then
+      VERBOSE=1; report_human; VERBOSE="$was_verbose"; continue
+    fi
+    if [[ "$go" == yes ]]; then
+      [[ "$ans" == [Nn]* ]] && { echo "Aborted."; KEEP=1; } || run_installer_now
+    else
+      [[ "$ans" == [Yy]* ]] && run_installer_now || { echo "Aborted."; KEEP=1; }
+    fi
+    return 0
+  done
 }
 
 # --- main --------------------------------------------------------------------

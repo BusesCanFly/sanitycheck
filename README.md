@@ -120,6 +120,8 @@ Three lines, phrased as what it would do to you. `import-shadow` and `mapbox-c2`
 
 `-v` adds the same list in full with locations, then every individual finding, then the LLM's caveats about what it didn't check.
 
+At a confirm prompt — the `-r` run prompt, or a hook's `run anyway?` after a `DANGEROUS` verdict — press `v` to print that detail in place, then answer. You can't add `-v` to a command the hook is wrapping, so the prompt offers it instead.
+
 A clean result is two lines and nothing else:
 
 ```

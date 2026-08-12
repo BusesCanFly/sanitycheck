@@ -61,10 +61,19 @@ _sc_ask() {  # question -> 0 = yes/proceed, 1 = no/skip
   [[ "$(_sc_readkey)" != [Nn] ]]
 }
 # Ask a no-default question (for the "run it anyway?" confirm after DANGEROUS).
-_sc_ask_risky() {  # question -> 0 = yes/proceed, 1 = no/abort
+# Any args after the question are a command that reprints the audit in full - the
+# user presses `v` to see it, since under the hook the tool can't be re-run with
+# -v by hand. Loops on `v`, otherwise y = proceed, anything else = abort.
+_sc_ask_risky() {  # question [detail-cmd...] -> 0 = yes/proceed, 1 = no/abort
   [[ -t 0 && -t 2 ]] || return 1        # non-interactive: refuse by default
-  printf '%s %s [y/N] ' "$(_sc_label)" "$1" >&2
-  [[ "$(_sc_readkey)" == [Yy] ]]
+  local q="$1"; shift
+  local vk=""; (( $# )) && vk="/v"
+  while :; do
+    printf '%s %s [y/N%s] ' "$(_sc_label)" "$q" "$vk" >&2
+    local k; k="$(_sc_readkey)"
+    if [[ -n "$vk" && "$k" == [Vv] ]]; then "$@"; continue; fi
+    [[ "$k" == [Yy] ]] && return 0 || return 1
+  done
 }
 
 # --- 1. curl|bash interception (zsh only; needs the zle line editor) ----------
@@ -181,10 +190,12 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
   [[ -z "$target" && "$project" == 1 && ${#pkgs[@]} -eq 0 ]] && target="."
 
   local rc=0 what="$disp${sub:+ $sub}"
+  local -a dtl; dtl=()                            # command `v` re-runs for detail
   if [[ -n "$target" && -e "$target" ]]; then
     # a local project/path -> full scan
     _sc_ask "audit '$target' before $what?" || { command "$cmd" "$@"; return $?; }
     "$bin" $(_sc_fast) "$target"; rc=$?          # deep unless SANITYCHECK_HOOK_FAST
+    dtl=("$bin" -v); [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && dtl+=(--fast); dtl+=("$target")
   elif [[ ${#pkgs[@]} -gt 0 ]]; then
     # named registry package(s) -> check the NAME(s) against IOCs and, when
     # online, download+scan the actual package contents (no cwd scan). Silent
@@ -203,6 +214,7 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
     [[ -n "$eco" ]] && cka+=(--ecosystem "$eco")
     [[ -n "${SANITYCHECK_HOOK_FAST:-}" ]] && cka+=(--fast)
     "$bin" "${cka[@]}" "${pkgs[@]}"; rc=$?
+    dtl=("$bin" -v "${cka[@]}" "${pkgs[@]}")
   else
     command "$cmd" "$@"; return $?
   fi
@@ -211,7 +223,7 @@ _sc_install_guard() {  # display-cmd  trigger-ere  project(0|1)  skip-lead  args
     if [[ "${SANITYCHECK_HOOK_STRICT:-0}" == "1" ]]; then
       _sc_say "$what aborted (DANGEROUS)."; return 1
     fi
-    _sc_ask_risky "DANGEROUS - run $what anyway?" || { _sc_say "$what aborted."; return 1; }
+    _sc_ask_risky "DANGEROUS - run $what anyway?" "${dtl[@]}" || { _sc_say "$what aborted."; return 1; }
   fi
   command "$cmd" "$@"
 }
@@ -240,7 +252,8 @@ _sc_runner_guard() {  # display  real-cmd  ecosystem  skip  args...
   "$bin" "${cka[@]}" "$pkg"; local rc=$?
   if [[ $rc -eq 1 ]]; then
     if [[ "${SANITYCHECK_HOOK_STRICT:-0}" == "1" ]]; then _sc_say "$disp aborted (DANGEROUS)."; return 1; fi
-    _sc_ask_risky "DANGEROUS - run $disp anyway?" || { _sc_say "$disp aborted."; return 1; }
+    _sc_ask_risky "DANGEROUS - run $disp anyway?" "$bin" -v "${cka[@]}" "$pkg" \
+      || { _sc_say "$disp aborted."; return 1; }
   fi
   command "$cmd" "$@"
 }
