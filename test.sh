@@ -317,9 +317,10 @@ fi
 "$SC" --offline --check-pkg --ecosystem npm skytext >/dev/null 2>&1; eq "npm ecosystem name match -> exit 1" "$?" "1"
 "$SC" --offline --check-pkg --ecosystem npm express >/dev/null 2>&1; eq "npm clean name -> exit 0" "$?" "0"
 
-echo "unit: maybe_run_installer inline 'v' (expand the report at the run prompt)"
+echo "unit: maybe_run_installer 'See the details?' offer (clean two-step run prompt)"
 # The run-after prompt is what the curl|bash hook drives; under the hook you can't
-# re-invoke with -v, so `v` reprints the full report in place, then re-asks.
+# re-invoke with -v, so findings get an offer to print the full report first, then
+# the ordinary run prompt - a clean SAFE result skips straight to it.
 eval "$(sed -n '/^maybe_run_installer()/,/^}/p' "$SC")"
 report_human()      { printf 'DETAIL(verbose=%s)\n' "$VERBOSE"; }
 run_installer_now() { printf 'RAN\n'; }
@@ -328,38 +329,42 @@ RUN_AFTER=1; MODE=installer
 # in a subshell, so KEEP set inside would not survive - a redirect keeps it in-shell.
 mtmp=$(mktemp)
 VERDICT=CAUTION; F_SEV=(HIGH MED); VERBOSE=0; KEEP=0
-maybe_run_installer > "$mtmp" 2>&1 <<< $'v\nn'
+maybe_run_installer > "$mtmp" 2>&1 <<< $'y\nn'          # see details = y, run = n
 mout=$(cat "$mtmp")
-[[ "$mout" == *"[y/N/v]"* ]] && pass "run-prompt offers v when there are findings" || fail "no v in prompt: $mout"
-[[ "$mout" == *"DETAIL(verbose=1)"* ]] && pass "v reprints the report in full" || fail "v did not expand: $mout"
-[[ "$mout" == *"Aborted."* && "$KEEP" == "1" && "$mout" != *RAN* ]] && pass "expand then n aborts without running" || fail "expand-then-abort (KEEP=$KEEP): $mout"
+[[ "$mout" == *"See the details?"* ]] && pass "findings: a 'See the details?' line precedes the run prompt" || fail "no details offer: $mout"
+[[ "$mout" == *"DETAIL(verbose=1)"* ]] && pass "answering y prints the full report" || fail "details not shown: $mout"
+[[ "$mout" == *"[y/N]"* && "$mout" != *"/v"* ]] && pass "run prompt stays a plain [y/N]" || fail "run prompt not clean: $mout"
+[[ "$mout" == *"Aborted."* && "$KEEP" == "1" && "$mout" != *RAN* ]] && pass "then n aborts without running" || fail "abort (KEEP=$KEEP): $mout"
 VERDICT=CAUTION; F_SEV=(HIGH); VERBOSE=0; KEEP=0
-maybe_run_installer > "$mtmp" 2>&1 <<< $'y'
-[[ "$(cat "$mtmp")" == *RAN* ]] && pass "y runs the installer" || fail "y did not run: $(cat "$mtmp")"
+maybe_run_installer > "$mtmp" 2>&1 <<< $'n\ny'          # skip details, run = y
+m2=$(cat "$mtmp")
+[[ "$m2" != *"DETAIL"* && "$m2" == *RAN* ]] && pass "declining details then y runs, no report printed" || fail "decline-then-run: $m2"
 VERDICT=SAFE; F_SEV=(); VERBOSE=0; KEEP=0
 maybe_run_installer > "$mtmp" 2>&1 <<< $''
 msafe=$(cat "$mtmp")
-[[ "$msafe" == *"[Y/n]"* && "$msafe" != *"/v]"* && "$msafe" == *RAN* ]] && pass "SAFE with no findings: plain [Y/n], default runs" || fail "safe path: $msafe"
+[[ "$msafe" != *"See the details?"* && "$msafe" == *"[Y/n]"* && "$msafe" == *RAN* ]] && pass "clean SAFE: no details offer, plain [Y/n], default runs" || fail "safe path: $msafe"
 rm -f "$mtmp"
 
-echo "unit: _sc_ask_risky inline 'v' (expand at the install/runner 'run anyway?' prompt)"
-# Source the loop with the interactive-tty guard stripped so keypresses can be
-# scripted. _sc_readkey normally reads one key from /dev/tty; feed it from fd 3 so
-# the keys survive the command-substitution subshell (a shared file offset, the
-# same property the tty has - a variable queue would reset on each $() call).
+echo "unit: _sc_ask_risky 'see the details?' offer (clean two-step 'run anyway?' prompt)"
+# Source with the interactive-tty guard stripped so keypresses can be scripted.
+# _sc_readkey normally reads one key from /dev/tty; feed it from fd 3 so the keys
+# survive the command-substitution subshell (a shared file offset, the property
+# the tty has - a variable queue would reset on each $() call).
 eval "$(sed -n '/^_sc_ask_risky()/,/^}/p' "$HERE/hooks/sanitycheck.zsh" | sed '/-t 0 && -t 2/d')"
 _sc_label()   { printf 'sanitycheck:'; }
 _sc_readkey() { local k; IFS= read -r -n1 -u3 k 2>/dev/null || k=""; printf '%s' "$k"; }
 _det() { _DET=$((_DET+1)); }           # stands in for "$bin -v ..."
 akt=$(mktemp)
-printf 'vn' > "$akt"; exec 3< "$akt"   # v (expand), then n (abort)
-_DET=0; _sc_ask_risky "run anyway?" _det >/dev/null 2>&1; eq "v then n -> abort (rc 1)" "$?" "1"; exec 3<&-
-eq "v ran the detail command once" "$_DET" "1"
-printf 'y'  > "$akt"; exec 3< "$akt"
-_DET=0; _sc_ask_risky "run anyway?" _det >/dev/null 2>&1; eq "y -> proceed (rc 0)" "$?" "0"; exec 3<&-
-eq "y did not run the detail command" "$_DET" "0"
-printf 'v'  > "$akt"; exec 3< "$akt"   # no detail cmd -> v isn't offered, treated as abort
-_sc_ask_risky "run anyway?" >/dev/null 2>&1; eq "no detail cmd: v is not special -> abort" "$?" "1"; exec 3<&-
+printf 'yn' > "$akt"; exec 3< "$akt"   # see details = y, run anyway = n
+_DET=0; _sc_ask_risky "run anyway?" _det >/dev/null 2>&1; eq "details y, run n -> abort (rc 1)" "$?" "1"; exec 3<&-
+eq "showed the detail once when asked" "$_DET" "1"
+printf 'ny' > "$akt"; exec 3< "$akt"   # skip details, run anyway = y
+_DET=0; _sc_ask_risky "run anyway?" _det >/dev/null 2>&1; eq "skip details, run y -> proceed (rc 0)" "$?" "0"; exec 3<&-
+eq "no detail shown when declined" "$_DET" "0"
+printf 'y'  > "$akt"; exec 3< "$akt"   # no detail cmd -> straight to the risky prompt
+_sc_ask_risky "run anyway?" >/dev/null 2>&1; eq "no detail cmd: y -> proceed (rc 0)" "$?" "0"; exec 3<&-
+printf 'n'  > "$akt"; exec 3< "$akt"
+_sc_ask_risky "run anyway?" >/dev/null 2>&1; eq "no detail cmd: n -> abort (rc 1)" "$?" "1"; exec 3<&-
 rm -f "$akt"
 
 echo "integration: installer mode (loopback-served fixtures, TP/TN)"

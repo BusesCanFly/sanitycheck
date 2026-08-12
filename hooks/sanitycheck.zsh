@@ -61,19 +61,18 @@ _sc_ask() {  # question -> 0 = yes/proceed, 1 = no/skip
   [[ "$(_sc_readkey)" != [Nn] ]]
 }
 # Ask a no-default question (for the "run it anyway?" confirm after DANGEROUS).
-# Any args after the question are a command that reprints the audit in full - the
-# user presses `v` to see it, since under the hook the tool can't be re-run with
-# -v by hand. Loops on `v`, otherwise y = proceed, anything else = abort.
+# Any args after the question are a command that reprints the audit in full. When
+# present it is offered as its own clean y/N first (the tool can't be re-run with
+# -v by hand under the hook), then the real question, in the [y/N] shape as before.
 _sc_ask_risky() {  # question [detail-cmd...] -> 0 = yes/proceed, 1 = no/abort
   [[ -t 0 && -t 2 ]] || return 1        # non-interactive: refuse by default
   local q="$1"; shift
-  local vk=""; (( $# )) && vk="/v"
-  while :; do
-    printf '%s %s [y/N%s] ' "$(_sc_label)" "$q" "$vk" >&2
-    local k; k="$(_sc_readkey)"
-    if [[ -n "$vk" && "$k" == [Vv] ]]; then "$@"; continue; fi
-    [[ "$k" == [Yy] ]] && return 0 || return 1
-  done
+  if (( $# )); then
+    printf '%s see the details? [y/N] ' "$(_sc_label)" >&2
+    [[ "$(_sc_readkey)" == [Yy] ]] && "$@"
+  fi
+  printf '%s %s [y/N] ' "$(_sc_label)" "$q" >&2
+  [[ "$(_sc_readkey)" == [Yy] ]]
 }
 
 # --- 1. curl|bash interception (zsh only; needs the zle line editor) ----------
