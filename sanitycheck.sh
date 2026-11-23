@@ -1805,23 +1805,27 @@ print(json.dumps(out, indent=2))
 }
 
 # --- input classification & acquisition --------------------------------------
-# The URL to fetch for an installer audit. An explicit http(s):// URL wins.
-# Otherwise the URL is the scheme-less argument of the curl/wget in the command
-# (`curl -fsSL example.com/install.sh | bash`), or the whole target when it is a
-# bare `host/path`. Both curl and wget treat a scheme-less URL as http://, so
-# that is what is fetched: the audit has to see the bytes the pipeline would.
-extract_url() {
-  local t="$1" u frag tok skip=0
-  local hostish='^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:[0-9]+)?(/.*)?$|^(localhost|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]+)?(/.*)?$'
-  u="$(printf '%s' "$t" | grep -oE 'https?://[^ "'"'"')]+' | head -1 || true)"
-  [[ -n "$u" ]] && { printf '%s\n' "$u"; return 0; }
-  if [[ "$t" != *[[:space:]]* && "$t" =~ $hostish ]]; then
-    printf 'http://%s\n' "$t"; return 0
-  fi
-  frag="$(printf '%s' "$t" | grep -oE '(^|[^A-Za-z0-9_])(curl|wget)[[:space:]][^|;&)]*' | head -1 || true)"
-  [[ -n "$frag" ]] || return 0
-  frag="${frag//\"/}"; frag="${frag//\'/}"
-  local -a toks; read -ra toks <<< "$frag"
+# Hosts a scheme-less URL may start with: a dotted name with a TLD, localhost,
+# or an IPv4 address, each with an optional port and path.
+URL_HOSTISH='^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:[0-9]+)?(/.*)?$|^(localhost|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]+)?(/.*)?$'
+
+# The scheme-less URL argument of one curl/wget command (`curl -fsSL
+# example.com/install.sh`), as http:// - the default both tools use for a URL
+# with no scheme, so it is what the command would really fetch. Prints nothing
+# when the command has no such argument (`curl "$URL"`, `curl --version`).
+fetch_cmd_url() { # "curl|wget args..."
+  local frag="$1" tok="" skip=0 q="" c i
+  # split into words the way the shell would, so a quoted value with spaces
+  # (`-H "Host: a.example"`) stays one word; no expansion is done
+  local -a toks=()
+  for (( i=0; i<${#frag}; i++ )); do
+    c="${frag:i:1}"
+    if [[ -n "$q" ]]; then [[ "$c" == "$q" ]] && q="" || tok+="$c"
+    elif [[ "$c" == [\"\'] ]]; then q="$c"
+    elif [[ "$c" == [[:space:]] ]]; then [[ -n "$tok" ]] && toks+=("$tok"); tok=""
+    else tok+="$c"; fi
+  done
+  [[ -n "$tok" ]] && toks+=("$tok")
   for tok in "${toks[@]:1}"; do
     (( skip )) && { skip=0; continue; }
     case "$tok" in
@@ -1838,9 +1842,32 @@ extract_url() {
         # (`wget -qO- host/x | sh`), and `-O -` is the only way it appears there.
         [[ "$tok" == "-O" && "${toks[0]}" == *curl ]] || skip=1 ;;
       -*) ;;
-      *) [[ "$tok" =~ $hostish ]] && { printf 'http://%s\n' "$tok"; return 0; } ;;
+      *) [[ "$tok" =~ $URL_HOSTISH ]] && { printf 'http://%s\n' "$tok"; return 0; } ;;
     esac
   done
+  return 0
+}
+
+# Each curl/wget command in the text, from the tool name up to the next shell
+# separator, one per line (input for fetch_cmd_url).
+fetch_cmd_frags() {
+  grep -oE '(^|[^A-Za-z0-9_.-])(curl|wget)[[:space:]][^|;&)<>`]*' 2>/dev/null \
+    | sed -E 's/^[^cw]*//' || true
+}
+
+# The URL to fetch for an installer audit. An explicit http(s):// URL wins.
+# Otherwise the URL is the scheme-less argument of the curl/wget in the command
+# (`curl -fsSL example.com/install.sh | bash`), or the whole target when it is a
+# bare `host/path`, both fetched as http:// (see fetch_cmd_url).
+extract_url() {
+  local t="$1" u frag
+  u="$(printf '%s' "$t" | grep -oE 'https?://[^ "'"'"')]+' | head -1 || true)"
+  [[ -n "$u" ]] && { printf '%s\n' "$u"; return 0; }
+  if [[ "$t" != *[[:space:]]* && "$t" =~ $URL_HOSTISH ]]; then
+    printf 'http://%s\n' "$t"; return 0
+  fi
+  frag="$(printf '%s' "$t" | fetch_cmd_frags | head -1)"
+  [[ -n "$frag" ]] && fetch_cmd_url "$frag"
   return 0
 }
 
@@ -2016,11 +2043,19 @@ STAGE_SEEN="|"
 
 # Extract the URLs a script actually downloads: those appearing as the argument
 # of a fetch command (curl/wget/fetch/urlretrieve/Invoke-WebRequest/Download*).
+# curl and wget also take a URL with no scheme (`curl -fsSL example.com/s2.sh`),
+# fetched as http://; the other fetchers here need one, so only those two are
+# checked for it.
 extract_fetch_urls() { # file
-  grep -oiE '(curl|wget|fetch|urlretrieve|Invoke-WebRequest|DownloadString|DownloadFile)[^|;&<>]*https?://[^ "'"'"')]+' "$1" 2>/dev/null \
-    | grep -oE 'https?://[^ "'"'"')]+' \
-    | sed 's/[]"'"'"');].*$//' \
-    | sort -u
+  { grep -oiE '(curl|wget|fetch|urlretrieve|Invoke-WebRequest|DownloadString|DownloadFile)[^|;&<>]*https?://[^ "'"'"')]+' "$1" 2>/dev/null \
+      | grep -oE 'https?://[^ "'"'"')]+' \
+      | sed 's/[]"'"'"');].*$//' || true   # no match is not an error (set -e)
+    local frag
+    while IFS= read -r frag; do
+      [[ "$frag" == *://* ]] && continue    # has a scheme: the grep above has it
+      fetch_cmd_url "$frag"
+    done < <(fetch_cmd_frags < "$1")
+  } | sort -u
 }
 
 resolve_installer_stages() {
