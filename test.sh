@@ -442,6 +442,87 @@ else
   echo "  (curl or python3 unavailable — skipping installer mode test)"
 fi
 
+echo "unit: deep --extract (staged archives; hardened, type from the bytes)"
+if command -v python3 >/dev/null 2>&1; then
+  xt=$(mktemp -d)
+  python3 - "$xt" <<'PYX'
+import gzip, io, sys, tarfile, zipfile
+d = sys.argv[1]
+with zipfile.ZipFile(f"{d}/evil.zip", "w") as z:
+    z.writestr("../../escape.sh", "x"); z.writestr("/abs.sh", "x"); z.writestr("ok/run.sh", "y")
+with tarfile.open(f"{d}/t.tgz", "w:gz") as t:
+    data = b"echo hi\n"; ti = tarfile.TarInfo("pkg/run.sh"); ti.size = len(data)
+    t.addfile(ti, io.BytesIO(data))
+    ln = tarfile.TarInfo("pkg/link"); ln.type = tarfile.SYMTYPE; ln.linkname = "/etc/passwd"
+    t.addfile(ln)
+open(f"{d}/run.sh.gz", "wb").write(gzip.compress(b"echo hi\n"))
+open(f"{d}/payload.zip", "wb").write(open(f"{d}/evil.zip", "rb").read())  # name says nothing
+open(f"{d}/plain.txt", "w").write("not an archive\n")
+PYX
+  xk() { python3 "$HERE/sanitycheck_deep.py" --extract "$xt/$1" --dest "$xt/out_$1" --name "${2:-payload.sh}"; }
+  eq "zip detected"                  "$(xk evil.zip)" "zip"
+  [[ -f "$xt/out_evil.zip/ok/run.sh" ]] && pass "zip member extracted" || fail "zip member missing"
+  [[ ! -e "$xt/escape.sh" && ! -e "$(dirname "$xt")/escape.sh" ]] && pass "zip ../ member not written outside" || fail "zip-slip"
+  eq "tar.gz detected"               "$(xk t.tgz)" "tar.gz"
+  [[ -f "$xt/out_t.tgz/pkg/run.sh" && ! -L "$xt/out_t.tgz/pkg/link" ]] && pass "tar member extracted, symlink skipped" || fail "tar extract/symlink"
+  eq "lone .gz detected"             "$(xk run.sh.gz run.sh)" "gz"
+  [[ -f "$xt/out_run.sh.gz/run.sh" ]] && pass "lone .gz written under --name" || fail "lone .gz output"
+  eq "non-archive -> nothing"        "$(xk plain.txt)" ""
+  [[ ! -e "$xt/out_plain.txt" ]] && pass "non-archive leaves no dest dir" || fail "non-archive created dest"
+  rm -rf "$xt"
+else
+  echo "  (python3 unavailable — skipping --extract test)"
+fi
+
+echo "integration: staged archives (installer pulls a zip / tar.gz / .gz by scheme-less URL)"
+if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  sd=$(mktemp -d); ssrv=$(mktemp)
+  # the payload is the inert malicious installer fixture, wrapped three ways;
+  # the "download" URL has no extension, so only its bytes say it is a zip
+  python3 - "$sd" "$FIX/installers" <<'PYS'
+import gzip, io, sys, tarfile, zipfile
+d, fx = sys.argv[1], sys.argv[2]
+bad, good = open(f"{fx}/malicious.sh", "rb").read(), open(f"{fx}/benign.sh", "rb").read()
+with zipfile.ZipFile(f"{d}/payload.zip", "w") as z: z.writestr("bin/run.sh", bad)
+with zipfile.ZipFile(f"{d}/ok.zip", "w") as z: z.writestr("bin/run.sh", good)
+with tarfile.open(f"{d}/payload.tgz", "w:gz") as t:
+    ti = tarfile.TarInfo("bin/run.sh"); ti.size = len(bad); t.addfile(ti, io.BytesIO(bad))
+open(f"{d}/run.sh.gz", "wb").write(gzip.compress(bad))
+open(f"{d}/download", "wb").write(open(f"{d}/payload.zip", "rb").read())
+PYS
+  python3 -c '
+import http.server, socketserver, sys, os
+os.chdir(sys.argv[1])
+with socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler) as h:
+    print(h.server_address[1], flush=True); h.serve_forever()
+' "$sd" >"$ssrv" 2>/dev/null &
+  SSRV=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$ssrv" ]] && break; sleep 0.2; done
+  SPORT="$(head -1 "$ssrv")"
+  if [[ -n "$SPORT" ]]; then
+    printf '#!/bin/sh\ncurl -fsSL -o /tmp/p.zip 127.0.0.1:%s/payload.zip && unzip /tmp/p.zip\n' "$SPORT" > "$sd/i_zip.sh"
+    printf '#!/bin/sh\ncurl -fsSL 127.0.0.1:%s/payload.tgz | tar xz\n' "$SPORT" > "$sd/i_tgz.sh"
+    printf '#!/bin/sh\ncurl -fsSL 127.0.0.1:%s/run.sh.gz | gunzip | sh\n' "$SPORT" > "$sd/i_gz.sh"
+    printf '#!/bin/sh\nwget -qO /tmp/x "127.0.0.1:%s/download?id=7"\n' "$SPORT" > "$sd/i_noext.sh"
+    printf '#!/bin/sh\ncurl -fsSLO 127.0.0.1:%s/ok.zip && unzip ok.zip\n' "$SPORT" > "$sd/i_ok.sh"
+    for k in zip tgz gz noext; do
+      sj="$("$SC" --no-llm --json "curl -fsSL 127.0.0.1:$SPORT/i_$k.sh | sh" 2>/dev/null)"
+      sv="$(printf '%s' "$sj" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["verdict"], any("_unpacked/" in f["file"] and f["tag"]=="ioc-str" for f in d["findings"]))' 2>/dev/null)"
+      eq "staged $k payload caught inside the unpacked archive" "$sv" "DANGEROUS True"
+    done
+    sj="$("$SC" --no-llm --json "curl -fsSL 127.0.0.1:$SPORT/i_ok.sh | sh" 2>/dev/null)"
+    sv="$(printf '%s' "$sj" | python3 -c 'import json,sys;print(json.load(sys.stdin)["verdict"])' 2>/dev/null)"
+    eq "benign staged zip stays SAFE" "$sv" "SAFE"
+    "$SC" --no-llm --no-follow "curl -fsSL 127.0.0.1:$SPORT/i_zip.sh | sh" >/dev/null 2>&1
+    eq "--no-follow does not fetch the zip" "$?" "0"
+  else
+    fail "staged archive test: loopback server did not start"
+  fi
+  kill "$SSRV" 2>/dev/null; wait "$SSRV" 2>/dev/null; rm -rf "$sd" "$ssrv"
+else
+  echo "  (curl or python3 unavailable — skipping staged archive test)"
+fi
+
 # An AppImage is a whole Linux application in one executable file: an ELF runtime
 # with a filesystem appended. Built here rather than committed, both to exercise
 # the real reader and to keep a binary out of the repo.

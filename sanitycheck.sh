@@ -2039,7 +2039,12 @@ acquire_file() { # single source file
 STAGE_MAX=8         # max total files fetched
 STAGE_DEPTH=3       # max chain depth (stage-2 -> stage-3 -> ...)
 STAGE_MAXSIZE=1048576
+# A staged archive (`curl -o p.zip host/p.zip && unzip p.zip && ./p/run`) gets a
+# larger download cap than a script: it carries the payload, often binaries.
+STAGE_ARCHIVE_MAXSIZE=31457280
 STAGE_SEEN="|"
+STAGE_UNPACKED=0
+STAGE_UNPACK_DIR=""
 
 # Extract the URLs a script actually downloads: those appearing as the argument
 # of a fetch command (curl/wget/fetch/urlretrieve/Invoke-WebRequest/Download*).
@@ -2076,15 +2081,29 @@ resolve_installer_stages() {
         (( fetched >= STAGE_MAX )) && break
         # give the stage a scannable extension (the content rules match on globs);
         # default to .sh since staged installer payloads are usually shell
-        local ext="sh"
-        case "$url" in
+        local ext="sh" base="${url%%[?#]*}" maxsize="$STAGE_MAXSIZE" tmo=6
+        case "$base" in
           *.py) ext="py" ;; *.ps1) ext="ps1" ;; *.rb) ext="rb" ;;
           *.js) ext="js" ;; *.pl) ext="pl" ;; *.php) ext="php" ;;
+          *.zip|*.tar|*.tgz|*.tar.gz|*.txz|*.tar.xz|*.tbz2|*.tar.bz2|*.gz|*.xz|*.bz2)
+            ext="bin"; maxsize="$STAGE_ARCHIVE_MAXSIZE"; tmo=30 ;;
         esac
         local out="$WORK_DIR/stage_$fetched.$ext"
-        if curl -fsSL --max-time 6 --max-filesize "$STAGE_MAXSIZE" -o "$out" "$url" 2>/dev/null; then
-          fetched=$((fetched+1)); newfiles+=("$out")
+        if curl -fsSL --max-time "$tmo" --max-filesize "$maxsize" -o "$out" "$url" 2>/dev/null; then
+          fetched=$((fetched+1))
           info "stage: fetched $url"
+          # An archive is unpacked and what is inside is followed in turn; the
+          # type comes from the bytes, so `host/download?id=7` counts too.
+          unpack_stage "$out" "$base"
+          if [[ -n "$STAGE_UNPACK_DIR" ]]; then
+            STAGE_UNPACKED=$((STAGE_UNPACKED+1))
+            info "stage: unpacked $url"
+            local uf
+            while IFS= read -r uf; do newfiles+=("$uf"); done \
+              < <(find "$STAGE_UNPACK_DIR" -type f -size -"$STAGE_MAXSIZE"c 2>/dev/null | head -n 50)
+          else
+            newfiles+=("$out")
+          fi
         fi
       done < <(extract_fetch_urls "$f" | head -n 20)
     done
@@ -2093,9 +2112,39 @@ resolve_installer_stages() {
     depth=$((depth+1))
   done
   if (( fetched > 0 )); then
+    local arch=""
+    (( STAGE_UNPACKED > 0 )) && arch=" ($STAGE_UNPACKED archive(s), unpacked and scanned inside)"
     add_finding LOW stage-resolved "$(rel "$SCRIPT_FILE")" 0 \
-      "Fetched and scanned $fetched staged download(s) referenced by the installer. Note: a server can serve benign content to a non-piped fetch, so a clean result here is not proof of safety."
+      "Fetched and scanned $fetched staged download(s) referenced by the installer$arch. Note: a server can serve benign content to a non-piped fetch, so a clean result here is not proof of safety."
   fi
+}
+
+# Unpack a fetched stage if it is an archive (zip, tar, tar.gz/xz/bz2, or one
+# gzip/xz/bzip2-compressed file). Sets STAGE_UNPACK_DIR to the directory it went
+# into, or to "" when the file is not an archive (a global, not stdout: this
+# can add a finding, which a $(...) subshell would lose). Extraction is the deep helper's (no member
+# outside the directory, no links, bounded size and count) - never unzip/tar on
+# a payload nobody asked for. The archive is renamed to its real extension so
+# the IOC hash pass, which picks archives out by name, sees it.
+unpack_stage() { # file url-without-query
+  local file="$1" url="$2" d="${1%.*}_unpacked" name kind
+  STAGE_UNPACK_DIR=""
+  if ! have python3 || [[ -z "$HELPER" || ! -f "$HELPER" ]]; then
+    case "$url" in *.zip|*.tar|*.tgz|*.tar.*|*.txz|*.tbz2|*.gz|*.xz|*.bz2)
+      add_finding LOW stage-unpacked "$(rel "$file")" 0 \
+        "Staged archive was downloaded but not unpacked (needs python3) - its contents were not scanned" ;;
+    esac
+    return 0
+  fi
+  # the name for a lone compressed file: the URL's, minus the compression
+  # suffix, kept scannable (`run.sh.gz` -> run.sh, `payload.gz` -> payload.sh)
+  name="${url##*/}"; name="${name%.gz}"; name="${name%.xz}"; name="${name%.bz2}"
+  name="${name//[^A-Za-z0-9._-]/_}"; name="${name#.}"
+  [[ "$name" == *.* ]] || name="${name:-payload}.sh"
+  kind="$(python3 "$HELPER" --extract "$file" --dest "$d" --name "$name" 2>/dev/null || true)"
+  [[ -n "$kind" ]] || return 0
+  mv -f "$file" "${file%.*}.$kind" 2>/dev/null || true
+  STAGE_UNPACK_DIR="$d"
 }
 
 # Vet package NAMES (from `pip/npm install <name>`) against the known-malicious

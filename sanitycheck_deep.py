@@ -39,6 +39,7 @@ only appears one level down.
 
 Usage:  sanitycheck_deep.py [--resolve] [--iocs FILE]... <root-dir>
         sanitycheck_deep.py --fetch pypi|npm|go|crates --dest DIR NAME...
+        sanitycheck_deep.py --extract FILE --dest DIR [--name NAME]
 """
 from __future__ import annotations
 
@@ -895,6 +896,69 @@ def _extract_zip(data: bytes, dest: str) -> None:
             files += 1
 
 
+# Magic bytes of the compressed wrappers tarfile can see through, and the
+# module that decompresses a lone file wrapped in one (a `.sh.gz` with no tar).
+_COMPRESSED = (
+    (b"\x1f\x8b", "gz", "gzip"),
+    (b"BZh", "bz2", "bz2"),
+    (b"\xfd7zXZ\x00", "xz", "lzma"),
+)
+
+
+def extract_archive(src: str, dest: str, name: str) -> str:
+    """Unpack a downloaded file into dest if it is an archive; return its kind.
+
+    For staged installer downloads (`curl -o p.zip host/p.zip && unzip p.zip`),
+    whose URL may say nothing about the format, so the type comes from the
+    file's own bytes. Kinds: "zip", "tar", "tar.gz"/"tar.bz2"/"tar.xz", or
+    "gz"/"bz2"/"xz" for a single compressed file, which is written out as
+    dest/name. Returns "" for anything else, leaving dest untouched. The same
+    hardened extractors as --fetch, so nothing is written outside dest and the
+    totals are bounded.
+    """
+    import io
+    import tarfile
+    import zipfile
+    try:
+        with open(src, "rb") as fh:
+            data = fh.read(FETCH_ARTIFACT_MAX + 1)
+    except OSError:
+        return ""
+    if len(data) > FETCH_ARTIFACT_MAX:
+        return ""
+    if data[:4] == b"PK\x03\x04" or zipfile.is_zipfile(io.BytesIO(data)):
+        try:
+            os.makedirs(dest, exist_ok=True)
+            _extract_zip(data, dest)
+            return "zip"
+        except Exception:
+            return ""
+    comp = next((c for c in _COMPRESSED if data.startswith(c[0])), None)
+    if comp or data[257:262] == b"ustar":
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+                tf.next()                      # raises if it is not a tar
+            os.makedirs(dest, exist_ok=True)
+            _extract_tar(data, dest)
+            return "tar." + comp[1] if comp else "tar"
+        except Exception:
+            pass
+    if comp:
+        import importlib
+        try:
+            mod = importlib.import_module(comp[2])
+            out = mod.decompress(data)
+        except Exception:
+            return ""
+        if len(out) > EXTRACT_MAX_BYTES or not _within(dest, name):
+            return ""
+        os.makedirs(dest, exist_ok=True)
+        with open(os.path.join(dest, name), "wb") as fh:
+            fh.write(out)
+        return comp[1]
+    return ""
+
+
 def http_get_json(url: str) -> dict | None:
     req = urllib.request.Request(url, headers={"User-Agent": "sanitycheck"})
     try:
@@ -1032,6 +1096,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dest", help="destination dir for --fetch")
     ap.add_argument("--check-names", choices=["pypi", "npm", "go"],
                     help="offline typosquat check of NAME... for an ecosystem")
+    ap.add_argument("--extract", metavar="FILE",
+                    help="unpack FILE into --dest if it is an archive; print its kind")
+    ap.add_argument("--name", default="payload.sh",
+                    help="file name for a lone compressed file under --extract")
     ap.add_argument("names", nargs="*", help="package names for --fetch/--check-names")
     args = ap.parse_args(argv[1:])
 
@@ -1066,6 +1134,15 @@ def main(argv: list[str]) -> int:
                     emit("HIGH", "typosquat", name, 0,
                          f"'{name}' is one edit from popular package '{pop}' - "
                          f"possible typosquat")
+        return 0
+
+    # extract mode: unpack one already-downloaded file (a staged installer
+    # payload). Prints the archive kind, or nothing when it is not an archive.
+    if args.extract:
+        if args.dest:
+            kind = extract_archive(args.extract, args.dest, args.name)
+            if kind:
+                print(kind)
         return 0
 
     # fetch mode: download + extract registry packages (no execution) so the
