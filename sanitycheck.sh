@@ -1805,7 +1805,44 @@ print(json.dumps(out, indent=2))
 }
 
 # --- input classification & acquisition --------------------------------------
-extract_url() { printf '%s' "$1" | grep -oE 'https?://[^ "'"'"')]+' | head -1 || true; }
+# The URL to fetch for an installer audit. An explicit http(s):// URL wins.
+# Otherwise the URL is the scheme-less argument of the curl/wget in the command
+# (`curl -fsSL example.com/install.sh | bash`), or the whole target when it is a
+# bare `host/path`. Both curl and wget treat a scheme-less URL as http://, so
+# that is what is fetched: the audit has to see the bytes the pipeline would.
+extract_url() {
+  local t="$1" u frag tok skip=0
+  local hostish='^([A-Za-z0-9-]+\.)+[A-Za-z]{2,}(:[0-9]+)?(/.*)?$|^(localhost|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]+)?(/.*)?$'
+  u="$(printf '%s' "$t" | grep -oE 'https?://[^ "'"'"')]+' | head -1 || true)"
+  [[ -n "$u" ]] && { printf '%s\n' "$u"; return 0; }
+  if [[ "$t" != *[[:space:]]* && "$t" =~ $hostish ]]; then
+    printf 'http://%s\n' "$t"; return 0
+  fi
+  frag="$(printf '%s' "$t" | grep -oE '(^|[^A-Za-z0-9_])(curl|wget)[[:space:]][^|;&)]*' | head -1 || true)"
+  [[ -n "$frag" ]] || return 0
+  frag="${frag//\"/}"; frag="${frag//\'/}"
+  local -a toks; read -ra toks <<< "$frag"
+  for tok in "${toks[@]:1}"; do
+    (( skip )) && { skip=0; continue; }
+    case "$tok" in
+      # options whose value is the next word (curl, then wget); the value of an
+      # option such as `-o install.sh` would otherwise pass for a hostname
+      -o|-H|-A|-u|-X|-d|-e|-b|-c|-x|-m|-w|-T|-F|-K|-r|-C|-E|-U|-Y|-y|-z|-P|-Q|\
+      --output|--header|--user-agent|--user|--request|--data|--data-*|--referer|\
+      --cookie|--cookie-jar|--proxy|--max-time|--connect-timeout|--retry|--retry-*|\
+      --write-out|--proto|--proto-redir|--cacert|--cert|--key|--resolve|--connect-to|\
+      --limit-rate|--max-filesize|--form|--config|--range|--interface|\
+      -O|-a|-t|-i|--output-document|--output-file|--append-output|--tries|--timeout|\
+      --directory-prefix|--input-file|--execute|--http-user|--http-password)
+        # curl's -O takes no value; wget's does. wget's -O is the common case
+        # (`wget -qO- host/x | sh`), and `-O -` is the only way it appears there.
+        [[ "$tok" == "-O" && "${toks[0]}" == *curl ]] || skip=1 ;;
+      -*) ;;
+      *) [[ "$tok" =~ $hostish ]] && { printf 'http://%s\n' "$tok"; return 0; } ;;
+    esac
+  done
+  return 0
+}
 
 classify_input() {
   local t="$1"
@@ -1823,6 +1860,11 @@ classify_input() {
     return
   fi
   if printf '%s' "$t" | grep -qE '(curl|wget)\b.*\|\s*(sudo\s+)?(ba)?sh|(bash|sh)\s+-c|<\(\s*(curl|wget)'; then
+    echo installer; return
+  fi
+  # a scheme-less script URL (`example.com/install.sh`): what a README's
+  # `curl -fsSL example.com/install.sh | bash` reduces to once the pipe is dropped
+  if [[ "$t" =~ ^(([A-Za-z0-9-]+\.)+[A-Za-z]{2,}|localhost|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]+)?/[^[:space:]]*\.(sh|bash)$ ]]; then
     echo installer; return
   fi
   if [[ "$t" =~ ^(https?|git|ssh)://|^git@|\.git$ ]]; then
