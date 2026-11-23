@@ -851,20 +851,30 @@ def _within(dest: str, member: str) -> bool:
     return t == d or t.startswith(d + os.sep)
 
 
-def _extract_tar(data: bytes, dest: str) -> None:
+def _new_budget() -> dict:
+    """Running totals for one extraction, nested layers included, so the caps
+    hold for the whole tree and a zip of zips cannot multiply them."""
+    return {"files": 0, "bytes": 0}
+
+
+def _over(budget: dict) -> bool:
+    return budget["files"] >= EXTRACT_MAX_FILES or budget["bytes"] >= EXTRACT_MAX_BYTES
+
+
+def _extract_tar(data: bytes, dest: str, budget: dict | None = None) -> None:
     import io
     import tarfile
-    files = total = 0
+    budget = _new_budget() if budget is None else budget
     with tarfile.open(fileobj=io.BytesIO(data)) as tf:
         for m in tf.getmembers():
-            if files >= EXTRACT_MAX_FILES or total >= EXTRACT_MAX_BYTES:
+            if _over(budget):
                 break
             if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
                 continue                       # skip links/devices (traversal)
             if not _within(dest, m.name):
                 continue
             if m.isfile():
-                total += max(m.size, 0)
+                budget["bytes"] += max(m.size, 0)
             try:
                 # filter="data" (Python 3.12+) sanitizes paths, ownership and
                 # permissions on top of the _within check above; older
@@ -875,25 +885,25 @@ def _extract_tar(data: bytes, dest: str) -> None:
                     tf.extract(m, dest)
             except Exception:
                 continue
-            files += 1
+            budget["files"] += 1
 
 
-def _extract_zip(data: bytes, dest: str) -> None:
+def _extract_zip(data: bytes, dest: str, budget: dict | None = None) -> None:
     import io
     import zipfile
-    files = total = 0
+    budget = _new_budget() if budget is None else budget
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for info in zf.infolist():
-            if files >= EXTRACT_MAX_FILES or total >= EXTRACT_MAX_BYTES:
+            if _over(budget):
                 break
             if not _within(dest, info.filename):
                 continue
-            total += info.file_size
+            budget["bytes"] += info.file_size
             try:
                 zf.extract(info, dest)
             except Exception:
                 continue
-            files += 1
+            budget["files"] += 1
 
 
 # Magic bytes of the compressed wrappers tarfile can see through, and the
@@ -905,7 +915,47 @@ _COMPRESSED = (
 )
 
 
-def extract_archive(src: str, dest: str, name: str) -> str:
+# How many archive layers below the downloaded one are unpacked (a zip in a
+# tarball in a zip is depth 2). The size/file caps are shared across all of them.
+NESTED_MAX_DEPTH = 3
+
+
+def _looks_archive(path: str) -> bool:
+    """Cheap magic-byte check before reading a whole extracted file."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(262)
+    except OSError:
+        return False
+    return (head[:4] == b"PK\x03\x04" or head[257:262] == b"ustar"
+            or any(head.startswith(c[0]) for c in _COMPRESSED))
+
+
+def _unpack_nested(dest: str, depth: int, budget: dict) -> None:
+    """Unpack archives found among the files just extracted into dest, each
+    into `<file>_unpacked` beside it. The archive itself is left in place so
+    its hash can still be checked against the IOC list."""
+    found = []
+    for dirpath, _dirs, files in os.walk(dest):       # does not follow links
+        for f in files:
+            p = os.path.join(dirpath, f)
+            if not os.path.islink(p) and _looks_archive(p):
+                found.append(p)
+    for p in sorted(found):
+        if _over(budget):
+            return
+        inner = p + "_unpacked"
+        if os.path.exists(inner):
+            continue
+        name = re.sub(r"\.(gz|xz|bz2)$", "", os.path.basename(p))
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name).lstrip(".")
+        if "." not in name:
+            name = (name or "payload") + ".sh"
+        extract_archive(p, inner, name, depth + 1, budget)
+
+
+def extract_archive(src: str, dest: str, name: str, depth: int = 0,
+                    budget: dict | None = None) -> str:
     """Unpack a downloaded file into dest if it is an archive; return its kind.
 
     For staged installer downloads (`curl -o p.zip host/p.zip && unzip p.zip`),
@@ -915,10 +965,17 @@ def extract_archive(src: str, dest: str, name: str) -> str:
     dest/name. Returns "" for anything else, leaving dest untouched. The same
     hardened extractors as --fetch, so nothing is written outside dest and the
     totals are bounded.
+
+    Archives inside it are unpacked too, NESTED_MAX_DEPTH layers deep, each
+    into `<inner archive>_unpacked` within dest; the returned kind is the
+    outermost one's.
     """
     import io
     import tarfile
     import zipfile
+    budget = _new_budget() if budget is None else budget
+    if _over(budget):
+        return ""
     try:
         with open(src, "rb") as fh:
             data = fh.read(FETCH_ARTIFACT_MAX + 1)
@@ -929,18 +986,22 @@ def extract_archive(src: str, dest: str, name: str) -> str:
     if data[:4] == b"PK\x03\x04" or zipfile.is_zipfile(io.BytesIO(data)):
         try:
             os.makedirs(dest, exist_ok=True)
-            _extract_zip(data, dest)
-            return "zip"
+            _extract_zip(data, dest, budget)
+            kind = "zip"
         except Exception:
             return ""
+        _nested(dest, depth, budget)
+        return kind
     comp = next((c for c in _COMPRESSED if data.startswith(c[0])), None)
     if comp or data[257:262] == b"ustar":
         try:
             with tarfile.open(fileobj=io.BytesIO(data)) as tf:
                 tf.next()                      # raises if it is not a tar
             os.makedirs(dest, exist_ok=True)
-            _extract_tar(data, dest)
-            return "tar." + comp[1] if comp else "tar"
+            _extract_tar(data, dest, budget)
+            kind = "tar." + comp[1] if comp else "tar"
+            _nested(dest, depth, budget)
+            return kind
         except Exception:
             pass
     if comp:
@@ -950,13 +1011,24 @@ def extract_archive(src: str, dest: str, name: str) -> str:
             out = mod.decompress(data)
         except Exception:
             return ""
-        if len(out) > EXTRACT_MAX_BYTES or not _within(dest, name):
+        if budget["bytes"] + len(out) > EXTRACT_MAX_BYTES or not _within(dest, name):
             return ""
         os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, name), "wb") as fh:
             fh.write(out)
+        budget["bytes"] += len(out)
+        budget["files"] += 1
+        _nested(dest, depth, budget)
         return comp[1]
     return ""
+
+
+def _nested(dest: str, depth: int, budget: dict) -> None:
+    if depth < NESTED_MAX_DEPTH:
+        try:
+            _unpack_nested(dest, depth, budget)
+        except Exception:
+            pass
 
 
 def http_get_json(url: str) -> dict | None:
